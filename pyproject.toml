@@ -1,0 +1,30 @@
+[project]
+name = "trio-logparser"
+version = "0.1.0"
+description = "Tooling to organize, process, and validate Trio / TandemKit beta-test logs"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+trio-logs = "trio_logparser.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# Log timestamps are local wall-clock times as written by the phone; naive datetimes are intended.
+ignore = ["DTZ001", "DTZ005", "DTZ007", "DTZ901"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trio_logparser"]

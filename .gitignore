@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# Never commit tester data: logs, archives, reports, crash logs
+*.txt
+*.zip
+*.ips
+*.log
+/data/
+/out/
