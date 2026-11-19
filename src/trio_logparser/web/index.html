@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Trio log viewer</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M1 11 L4 7 L7 9 L10 3 L15 6' fill='none' stroke='%232563d9' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header id="top">
+  <strong class="brand">Trio logs</strong>
+  <label class="pick">View <select id="source" aria-label="Log source"></select></label>
+  <span id="day-pick" hidden>
+    <label class="pick">from <select id="day" aria-label="First day"></select></label>
+    <label class="pick">for <select id="ndays" aria-label="Number of days"></select></label>
+  </span>
+  <span id="summary"></span>
+  <span class="spacer"></span>
+  <span id="mask-badge"></span>
+</header>
+
+<section id="chart-wrap" aria-label="Timeline">
+  <div id="chart-tools">
+    <span class="btns" id="zoom-btns"></span>
+    <span class="btns">
+      <button id="pan-left" title="Pan left (←)">◀</button>
+      <button id="pan-right" title="Pan right (→)">▶</button>
+      <button id="zoom-out" title="Zoom out">−</button>
+    </span>
+    <span id="view-label"></span>
+    <span id="chart-hint" title="Drag across the chart to zoom in, scroll to zoom around the pointer, double-click to see everything. Click to move the table to that time; click a marker in the loop / pump / findings rows to open it. ← → pan.">ⓘ how to use</span>
+    <span class="spacer"></span>
+    <span class="legend">
+      <span><i class="dot g-in"></i>CGM</span>
+      <span><i class="dot g-bf"></i>backfill</span>
+      <span><i class="sw basal"></i>temp basal</span>
+      <span><i class="sw susp"></i>suspended</span>
+      <span><i class="bar smb"></i>SMB</span>
+      <span><i class="bar bolus"></i>bolus</span>
+      <span><i class="ln iob"></i>IOB</span>
+      <span><i class="ln cob"></i>COB</span>
+      <span title="The IOB the pump itself shows (ControlIQIOBResponse). It counts by the pump's own rules, so it follows Trio's IOB only roughly; look for the two drifting apart."><i class="ln piob"></i>pump IOB</span>
+    </span>
+  </div>
+  <div id="chart"></div>
+  <div id="brush" hidden></div>
+  <div id="tip" hidden></div>
+</section>
+
+<nav id="tabs" role="tablist"></nav>
+
+<main id="main">
+  <div id="toolbar"></div>
+  <div id="content">
+    <div id="table" class="vt"></div>
+    <div id="page" hidden></div>
+    <div id="splitter" title="Drag to resize"></div>
+    <aside id="detail"><p class="muted">Select a row to see the full log line, what was parsed from it, and the lines around it.</p></aside>
+  </div>
+</main>
+
+<div id="loading" hidden><div class="box"><div class="spinner"></div><span id="loading-text">Loading…</span></div></div>
+<script src="/app.js"></script>
+</body>
+</html>

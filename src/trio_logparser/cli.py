@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import historylog, organize, report
+from . import historylog, organize, report, web
 
 
 def logs_root(args: argparse.Namespace) -> Path:
@@ -89,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     h.set_defaults(func=cmd_history_jsonl)
 
     report.add_commands(sub)
+    web.add_command(sub)
 
     args = p.parse_args(argv)
     return args.func(args)

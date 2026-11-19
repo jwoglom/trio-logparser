@@ -89,17 +89,19 @@ class Day:
         return self
 
 
-def from_export(path: Path, person: str) -> tuple[list[Day], Header]:
+def from_export(path: Path, person: str,
+                records: Iterable[Record] | None = None) -> tuple[list[Day], Header]:
     """Days of one export file (any number of days), split by local date, plus its header.
-    Every day points at ``path``, so line numbers are the file's own."""
+    Every day points at ``path``, so line numbers are the file's own. ``records``: the file's
+    already-parsed records, if the caller has them."""
     path = Path(path)
-    records: dict[str, dict[str, list[Record]]] = {}
-    for r in parse_export(path):
-        records.setdefault(r.ts.date().isoformat(), {"trio": [], "tandem": []})[r.src].append(r)
+    by_day: dict[str, dict[str, list[Record]]] = {}
+    for r in parse_export(path) if records is None else records:
+        by_day.setdefault(r.ts.date().isoformat(), {"trio": [], "tandem": []})[r.src].append(r)
     days = []
-    for key in sorted(records):
+    for key in sorted(by_day):
         d = Day(person, key, export_path=path)
-        for src, rs in records[key].items():
+        for src, rs in by_day[key].items():
             d._set(src, rs)
         days.append(d)
     return days, read_header(path)

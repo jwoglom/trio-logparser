@@ -136,6 +136,11 @@ def _cache_dir() -> Path:
     return Path(base) / "trio-logparser" / "historylog-export"
 
 
+def cached_exporters() -> list[Path]:
+    """Decoders built so far (one per TandemKit commit), oldest first."""
+    return sorted(_cache_dir().glob("*/historylog-export"), key=lambda p: p.stat().st_mtime)
+
+
 def build_exporter(repo: Path, rev: str = "HEAD", log=print) -> Path:
     """Compile (once per TandemKit commit) the helper that decodes stream cargo with TandemKit."""
     sha = _git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")

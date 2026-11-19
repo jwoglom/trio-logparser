@@ -100,6 +100,47 @@ transmitter IDs and emails; still treat its output as health data. A TandemKit d
 same dose ids as the log; findings add the pump id it names (`bolusId 123`). It embeds the pump
 serial in bytes 2–5: keep real ones out of anything public.
 
+## Browse in a web page
+
+```sh
+uv run trio-logs web --file "Trio Logs 2026-11-18 1301.txt"   # one export (repeat --file for more)
+uv run trio-logs web                                          # the organized tree: pick a tester, a day, how many days
+```
+
+Opens `http://127.0.0.1:8765/`. At the top is a timeline: CGM readings, enacted temp basals, SMBs
+and boluses (✕ = failed), pump suspensions, Trio's IOB and COB, the pump's own IOB, and rows of
+loop, pump-connection and finding markers. Drag to zoom, scroll to zoom around the pointer,
+double-click for everything; clicking moves the table below to that time. Tabs:
+
+| Tab | Rows |
+|---|---|
+| Log | Every line, all sources merged in time order; filter by source, level, category, text or `/regex/`. |
+| Insulin | Each delivery action as Trio (request, outcome, the dose it stored), the driver (TandemKit's lines) and the pump (the request on the wire and its status) saw it. |
+| CGM | Readings. Dexcom G7 live and backfill messages are dated by the sensor; for other CGMs, the BG each loop started from. |
+| Loop & oref | Each `Algorithm` determination (BG, IOB, COB, eventual BG, temp, SMB, ISF, CR, target, autosens, insulinReq, reason) and what Trio did next. |
+| Pump comms | Each request with its outcome (response, timeout, cancelled, refused, disconnect, none logged) and latency. |
+| Pump history | The records the logged history-log stream packets carry, by sequence number, with how often each was read. |
+| Findings | The checks' findings (as `findings`). |
+| Export & builds | The export header and the builds running. |
+
+Every row opens its log line, with the lines around it and its `trio-logs show` command. By
+default "chart window only" limits the tables to the zoomed time window.
+
+- **Pump history** is decoded with TandemKit's own classes, as `history-jsonl` does: with
+  `--tandemkit-repo` (or `$TANDEMKIT_REPO`) the decoder is built for `--tandemkit-rev` on first use;
+  otherwise the newest one already built is used; failing both, only each record's header (type id,
+  pump time, sequence number) is shown.
+- **Pump IOB** is the IOB the pump displays (`ControlIQIOBResponse`, the calculation its `iobType`
+  names, in milliunits). The pump counts by its own rules, so it follows Trio's IOB only roughly;
+  look for the two drifting apart, not for equality.
+- **Privacy.** The server listens on loopback only and answers only requests addressed to
+  `127.0.0.1`/`localhost`/`[::1]`, so other web pages can't read it through DNS rebinding. Pages
+  load nothing from other hosts (a `Content-Security-Policy` enforces it) and aren't cached. Text
+  is masked as `show` masks it (`--unmasked` shows it as logged) and testers are initials unless
+  `--names`. What's on screen is still health data: keep screenshots out of public issues.
+- Views are parsed when first opened and kept while the server runs (the last 4). Restart it to
+  pick up newly organized logs.
+
 ### How it works
 
 | Stage | Module | |
@@ -109,6 +150,7 @@ serial in bytes 2–5: keep real ones out of anything public.
 | builds | `builds.py` | Each launch line (`Trio started: v… <branch> <commit>; … TandemKit <sha>`, or the older `Trio Started … [Branch: …]`) starts a build; an export header's `== App ==` build covers its window when no launch is logged in it; days inherit the build running when they begin. |
 | checks | `checks.py` | Each finding points at a log line. Severity `high` = Trio and the pump disagree about insulin, `warn` = something failed or went missing, `info` = expected but counted. |
 | known issues | `known.py`, `known_issues.json` | TandemKit fixes with log signatures. A symptom on a build without the fix is *fixed later*; on a build with it, *regression?* — flagged only for **definitive** signatures (the fix removed that log text). |
+| web | `viewer.py`, `web.py`, `web/` | `viewer.py` parses a view once and derives its tables (CGM, oref, doses, pump comms, pump IOB, markers, findings, pump history), each row pointing at its line; `web.py` serves them as JSON on loopback; `web/` is the page (plain JS, no dependencies; log text only ever enters it as DOM text). |
 
 Checks:
 

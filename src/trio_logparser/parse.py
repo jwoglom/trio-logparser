@@ -56,6 +56,7 @@ class Record:
     msg: str
     lineno: int  # 1-based line number in the source file
     extra: list[str] = field(default_factory=list)  # continuation lines
+    source: str = ""  # the line's own source: Trio, Watch, Pump, CGM, Algorithm, ...
 
     @property
     def text(self) -> str:
@@ -88,9 +89,10 @@ def parse_trio(path: Path) -> Iterator[Record]:
             yield cur
         elif pending:
             ts = datetime.fromisoformat(m["ts"])
-            yield Record("trio", ts, m["tz"], ORPHAN, "", "", "", pending[0], first_lineno, pending[1:])
+            yield Record("trio", ts, m["tz"], ORPHAN, "", "", "", pending[0], first_lineno, pending[1:],
+                         "Trio")
         cur = Record("trio", datetime.fromisoformat(m["ts"]), m["tz"], level, cat, m["file"],
-                     m["func"], m["msg"], i)
+                     m["func"], m["msg"], i, source="Watch" if level == "WATCH" else "Trio")
     if cur is not None:
         yield cur
 
@@ -103,9 +105,9 @@ def parse_tandem(path: Path) -> Iterator[Record]:
         m = _TANDEM.match(line) if line[:2] == "[2" else None
         if m:
             rec = Record("tandem", datetime.fromisoformat(m["ts"]), m["tz"], m["level"], "",
-                         m["file"], m["func"], m["msg"], i)
+                         m["file"], m["func"], m["msg"], i, source="Pump")
         elif prev is not None:
-            rec = Record("tandem", prev.ts, prev.tz, TORN, "", "", "", line, i)
+            rec = Record("tandem", prev.ts, prev.tz, TORN, "", "", "", line, i, source="Pump")
         else:
             continue  # torn line before any timestamp: nothing to anchor it to
         yield rec
@@ -156,16 +158,17 @@ def parse_export(path: Path) -> Iterator[Record]:
             dm = _EXPORT_DEVICE.match(rest)
             body = dm["msg"] if dm else rest
             if tm := _EXPORT_TANDEM.match(body):
-                cur = Record("tandem", ts, tz, tm["level"], dm["cat"], tm["file"], tm["func"], tm["msg"], i)
+                cur = Record("tandem", ts, tz, tm["level"], dm["cat"], tm["file"], tm["func"], tm["msg"], i,
+                             source=source)
             else:  # another pump driver's free-form line
-                cur = Record("tandem", ts, tz, "INFO", dm["cat"] if dm else "", "", "", body, i)
+                cur = Record("tandem", ts, tz, "INFO", dm["cat"] if dm else "", "", "", body, i, source=source)
         elif source in ("Trio", "Watch") and (am := _EXPORT_APP.match(rest)):
             level = am["level"] or ("WATCH" if source == "Watch" else "INFO")
-            cur = Record("trio", ts, tz, level, am["cat"], "", "", am["msg"], i)
+            cur = Record("trio", ts, tz, level, am["cat"], "", "", am["msg"], i, source=source)
         else:  # CGM / Algorithm / other device sources: kept as trio-side context
             dm = _EXPORT_DEVICE.match(rest)
             cur = Record("trio", ts, tz, "INFO", source if not dm else f"{source}/{dm['cat']}", "", "",
-                         dm["msg"] if dm else rest, i)
+                         dm["msg"] if dm else rest, i, source=source)
     if cur is not None:
         yield cur
 
