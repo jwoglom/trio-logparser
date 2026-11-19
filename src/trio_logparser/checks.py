@@ -343,7 +343,7 @@ _SYNC_ID = {1: "bolusId", 2: "tempRateId", 3: "history record", 4: "extended bol
 
 
 def dose_label(raw: str) -> str:
-    """What a dose's ``raw`` names, without the pump serial its bytes 2-5 hold."""
+    """The pump id a dose's ``raw`` names (``bolusId 257``), shown beside the raw itself."""
     if len(raw) == 20 and raw[:2] == "01" and (scheme := int(raw[2:4], 16)) in _SYNC_ID:
         ident = int.from_bytes(bytes.fromhex(raw[12:]), "little")
         if scheme == 5:
@@ -371,9 +371,9 @@ def misdated_dose(d: Day) -> Iterator[Finding]:
     for (kind, raw), sends in doses.items():
         e = sends[0]
         problem = e.data["problem"]
-        what = f"{kind} ({dose_label(raw)})"
+        what = f"{kind} {raw} ({dose_label(raw)})" if raw else f"{kind} ({dose_label(raw)})"
         times = f" ({len(sends)} times)" if len(sends) > 1 else ""
-        info = {"type": kind, "dose": dose_label(raw), "sends": len(sends), **problem}
+        info = {"type": kind, "raw": raw, "dose": dose_label(raw), "sends": len(sends), **problem}
         if (ahead := problem.get("start_ahead")) is not None:
             # the host counts a bolus from its start, so one moved to now is insulin it thinks is fresh
             sev = "high" if kind in ("bolus", "tempBasal") and ahead >= MISDATED_HIGH else "warn"
@@ -401,6 +401,17 @@ HISTORY_REPORT_WINDOW = 120  # s a backfill tick's reads precede its bolus repor
 # TandemKit reports no history bolus older than 24 h; 12 h more for a pump clock in another zone.
 STALE_HISTORY = timedelta(hours=36)
 BOLUS_RECORD = {BOLUS_COMPLETED: "bolusId", BOLEX_ACTIVATED: "extended bolusId"}
+BOLUS_RECORD_SCHEME = {BOLUS_COMPLETED: 1, BOLEX_ACTIVATED: 4}  # its doses' raw scheme byte
+
+
+def _dose_raws(d: Day) -> dict[tuple[int, int], str]:
+    """(raw scheme, pump id) -> the raw the day's log names that dose by."""
+    out = {}
+    for e in d.tandem:
+        raw = e.data.get("raw", "") if e.kind == "misdated_dose" else ""
+        if len(raw) == 20 and raw[:2] == "01":
+            out[(int(raw[2:4], 16), int.from_bytes(bytes.fromhex(raw[12:]), "little"))] = raw
+    return out
 
 
 @check("history_bolus", "History bolus reports right after reading bolus records stamped far from the phone's clock")
@@ -408,6 +419,14 @@ def history_bolus(d: Day) -> Iterator[Finding]:
     """The log does not say which boluses a pass reported, only how many; the records it had just
     read say what it had to report from."""
     streams = Index([e for e in d.tandem if e.kind == "history_stream" and e.data["boluses"]])
+    raws = _dose_raws(d)
+
+    def name(b: dict) -> str:
+        """The record's pump id, after the dose's raw when the log names the dose by one."""
+        ident = f"{BOLUS_RECORD[b['type']]} {b['bolus_id']}"
+        raw = raws.get((BOLUS_RECORD_SCHEME[b["type"]], b["bolus_id"]))
+        return f"{raw} ({ident})" if raw else ident
+
     for e in d.tandem:
         if e.kind != "history_bolus_report":
             continue
@@ -419,7 +438,7 @@ def history_bolus(d: Day) -> Iterator[Finding]:
                     stale[(b["type"], b["bolus_id"])] = (b, off.total_seconds())
         if not stale:
             continue
-        listed = [f"{BOLUS_RECORD[b['type']]} {b['bolus_id']}" + (f" {b['units']:g} U" if b["units"] is not None else "")
+        listed = [name(b) + (f" {b['units']:g} U" if b["units"] is not None else "")
                   for b, _ in list(stale.values())[:4]]
         count = e.data["count"]
         yield _f("history_bolus.stale", "high", d, e,
@@ -429,7 +448,8 @@ def history_bolus(d: Day) -> Iterator[Finding]:
                  f"{', '.join(listed)}{', …' if len(stale) > len(listed) else ''}",
                  reported=count,
                  stale=[{"record": BOLUS_RECORD[b["type"]], "bolus_id": b["bolus_id"], "units": b["units"],
-                         "off_s": off} for b, off in stale.values()])
+                         "raw": raws.get((BOLUS_RECORD_SCHEME[b["type"]], b["bolus_id"])), "off_s": off}
+                        for b, off in stale.values()])
 
 
 RATCHET_FOLLOWS = 15  # s from a prune to the deeper slice it lets the walk take

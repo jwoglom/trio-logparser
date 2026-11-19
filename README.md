@@ -96,8 +96,9 @@ with no launch in them, from the saved export header's `== App ==` section.
 
 Testers are shown as initials by default (`--names` for full names). `show` masks pump serials,
 transmitter IDs and emails; still treat its output as health data. A TandemKit dose's `raw`
-(`0101…`–`0105…`, 20 hex digits) holds the pump serial in bytes 2–5, which Trio's export leaves in:
-`show` masks it and findings name the dose by its pump id (`bolusId 123`) instead.
+(`0101…`–`0105…`, 20 hex digits) is left as Trio's export prints it, so findings and `show` use the
+same dose ids as the log; findings add the pump id it names (`bolusId 123`). It embeds the pump
+serial in bytes 2–5: keep real ones out of anything public.
 
 ### How it works
 

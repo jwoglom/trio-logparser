@@ -432,7 +432,7 @@ def test_bolus_records_decode_completions_and_extended_parts():
 def test_misdated_dose_start_ahead(tmp_path, kind, start, expected):
     [f] = run("misdated_dose", day(tmp_path, [], [misdated("00:10:00", kind, RAW_BOLUS, *start_ahead(start))]))
     assert (f.check, f.severity) == expected
-    assert "bolusId 257" in f.summary and "78563412" not in f.summary and RAW_BOLUS not in str(f.data)
+    assert f"{RAW_BOLUS} (bolusId 257)" in f.summary and f.data["raw"] == RAW_BOLUS
     assert ("ending 2030-01-01" in f.summary) == start.startswith("2030")
 
 
@@ -441,7 +441,8 @@ def test_misdated_dose_is_one_finding_per_dose_however_often_resent(tmp_path):
     d = day(tmp_path, [], [misdated("00:10:00", "bolus", RAW_BOLUS, problem, sent)]
             + [misdated(f"00:{m}:00", "bolus", RAW_EXTENDED, problem, sent) for m in (10, 15, 20)])
     found = run("misdated_dose", d)
-    assert [(f.data["dose"], f.data["sends"]) for f in found] == [("bolusId 257", 1), ("extended bolusId 257", 3)]
+    assert [(f.data["raw"], f.data["dose"], f.data["sends"]) for f in found] == [
+        (RAW_BOLUS, "bolusId 257", 1), (RAW_EXTENDED, "extended bolusId 257", 3)]
     assert "(3 times)" in found[1].summary
 
 
@@ -521,13 +522,11 @@ def test_pump_clock_adjusted(tmp_path, line, expected):
         assert (found[0].severity, found[0].src) == (expected[0], "trio") and expected[1] in found[0].summary
 
 
-def test_mask_hides_the_pump_serial_inside_a_dose_raw():
+def test_mask_leaves_dose_raws_as_the_export_prints_them():
     from trio_logparser.normalize import mask
 
-    assert mask(f"Misdated bolus {RAW_BOLUS} starts at") == "Misdated bolus 0101<SN>01010000 starts at"
-    assert mask(f"eventRaw {RAW_EXTENDED}, tempPercent 0%") == "eventRaw 0104<SN>01010000, tempPercent 0%"
-    longer = "0101" + "78563412" * 4
-    assert mask(f"bytes {longer}") == f"bytes {longer}"
+    for line in (f"Misdated bolus {RAW_BOLUS} starts at", f"eventRaw {RAW_EXTENDED}, tempPercent 0%"):
+        assert mask(line) == line
 
 
 def test_known_issue_ties_misdated_starts_to_the_new_checks():
@@ -558,3 +557,17 @@ def test_export_flags_history_doses_sent_as_now(tmp_path):
     assert [(f.check, f.severity) for f in found] == [
         ("pump_clock.adjusted", "high"), ("history_bolus.stale", "high"), ("misdated_dose.start_ahead", "high")]
     assert [f.lineno for f in found] == [8, 11, 12]
+
+
+def test_history_bolus_names_the_raw_the_log_uses(tmp_path):
+    problem, sent = start_ahead("2030-01-01 00:00:00 +0000")
+    d = day(tmp_path, [], [
+        tandem("00:10:00", "Backfilling history 100-354 (255 entries)"),
+        stream("00:10:01", bolus_completed(257, 2.0, datetime(2026, 3, 1, 8, 30)),
+               bolex_activated(257, 1.5, datetime(2026, 3, 1, 8, 30))),
+        tandem("00:10:03", "Reporting 2 bolus event(s) from pump history"),
+        misdated("00:10:03", "bolus", RAW_BOLUS, problem, sent),  # only the immediate part has a raw here
+    ])
+    [f] = run("history_bolus", d)
+    assert f"{RAW_BOLUS} (bolusId 257) 2 U" in f.summary and "extended bolusId 257 1.5 U" in f.summary
+    assert [s["raw"] for s in f.data["stale"]] == [RAW_BOLUS, None]

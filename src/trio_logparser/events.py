@@ -149,7 +149,7 @@ _TANDEM_RULES: list[tuple[str, re.Pattern, dict]] = [
     ("suspended", re.compile(r"^Insulin Delivery Suspended!"), {}),
     ("resumed", re.compile(r"^Insulin Delivery Resumed!"), {}),
     # HostDoseDates: a dose whose dates the host could not store, and the dates sent in their place.
-    # `raw` carries the pump serial (bytes 2-5), so it stays out of findings.
+    # `raw` is the dose's id as Trio and TandemKit log it (it embeds the pump serial in bytes 2-5).
     ("misdated_dose", re.compile(rf"^Misdated (?P<type>\w+) (?P<raw>[0-9a-f]*) ?(?P<problem>.*); "
                                  rf"sent as (?P<sent_start>{_SWIFT_DATE}) to (?P<sent_end>{_SWIFT_DATE})$"),
      {"problem": misdated_problems, "sent_start": swift_date, "sent_end": swift_date}),
