@@ -11,7 +11,7 @@ import bisect
 import os
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -31,20 +31,37 @@ class Build:
         return f"TK {self.tandemkit or '?'} ({self.branch} v{self.version})"
 
 
-def assign(days: list[Day]) -> None:
-    """Fill ``day.builds`` for days sorted by (person, day)."""
-    last: dict[str, Build] = {}
+def assign(days: list[Day], headers: dict[str, list] | None = None) -> None:
+    """Fill ``day.builds``: each launch starts a build, and a day inherits the build running when
+    it began.
+
+    ``headers`` (person -> export ``Header``s) add what an export says ran when it was made: with
+    no launch logged in its window, that build ran for the whole window (Trio starts are rare,
+    so most export windows have none).
+    """
+    by_person: dict[str, list[Day]] = {}
     for d in days:
-        d.builds = []
-        if d.person in last:
-            d.builds.append((datetime.min, last[d.person]))
-        for e in d.trio:
-            if e.kind == "app_start":
-                b = Build(e.data["version"], e.data["branch"], e.data["commit"], e.data.get("tandemkit"))
+        by_person.setdefault(d.person, []).append(d)
+    for person, pdays in by_person.items():
+        anchors = [(e.ts, Build(e.data["version"], e.data["branch"], e.data["commit"], e.data.get("tandemkit")))
+                   for d in pdays for e in d.trio if e.kind == "app_start"]
+        starts = [t for t, _ in anchors]
+        for h in (headers or {}).get(person, ()):
+            lo = h.window_start
+            if h.build and lo and not any(lo <= t <= h.created for t in starts):
+                anchors.append((lo, h.build))
+        anchors.sort(key=lambda a: a[0])
+        times = [t for t, _ in anchors]
+        for d in pdays:
+            day_start = datetime.fromisoformat(d.day)
+            day_end = day_start + timedelta(days=1)
+            d.builds = []
+            i = bisect.bisect_left(times, day_start)
+            if i:
+                d.builds.append((datetime.min, anchors[i - 1][1]))
+            for t, b in anchors[i:bisect.bisect_left(times, day_end)]:
                 if not d.builds or d.builds[-1][1] != b:
-                    d.builds.append((e.ts, b))
-        if d.builds:
-            last[d.person] = d.builds[-1][1]
+                    d.builds.append((t, b))
 
 
 def build_at(day: Day, ts: datetime) -> Build | None:

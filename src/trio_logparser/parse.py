@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from .export import LOG_HEADER, is_export_text
+
 _TRIO = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?P<tz>[+-]\d{4}) \[(?P<cat>[^\]]*)\] "
     r"(?P<file>\S+) - (?P<func>.*?) - (?P<line>\d+) - (?P<level>[A-Z]+): (?P<msg>.*)$"
@@ -110,8 +112,8 @@ def parse_tandem(path: Path) -> Iterator[Record]:
         prev = rec
 
 
-# Trio's "Trio Logs" export (Trio 1.0.2+, Settings ▸ Share logs): a header (== App ==, == Pump ==,
-# ...), then ``== Log ==`` and every source merged in time order, continuation lines indented 4::
+# Trio's log export (Trio 1.0.2+, see ``export.py``): a header (== App ==, == Pump ==, ...), then
+# ``== Log ==`` and every source merged in time order, continuation lines indented 4::
 #
 #     2026-11-17 15:10:31.486 -0500 Trio [Lifecycle] Trio started: v1.0.2.76 (1) ...
 #     2026-11-17 15:47:09.671 -0500 Trio WARNING: [Loop] Loop failed: ...
@@ -120,8 +122,6 @@ def parse_tandem(path: Path) -> Iterator[Record]:
 #     2026-11-17 15:47:09.685 -0500 Algorithm suggested · BG 149 · ...
 #
 # Pump lines come from Trio's device-log store, not TandemLogger's file, so they are never torn.
-EXPORT_MAGIC = "Trio Logs"
-EXPORT_LOG_HEADER = "== Log =="
 _EXPORT = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?) (?P<tz>[+-]\d{4}) (?P<source>\S+) (?P<rest>.*)$"
 )
@@ -131,8 +131,9 @@ _EXPORT_TANDEM = re.compile(r"^\[(?P<level>[A-Z]+)\] (?P<file>\S+) - (?P<func>.*
 
 
 def is_export(path: Path) -> bool:
+    """Whether ``path`` is a Trio log export (any variant) or an organized export day file."""
     with open(path, encoding="utf-8", errors="replace") as f:
-        return f.readline().rstrip("\r\n") == EXPORT_MAGIC
+        return is_export_text(f.readline())
 
 
 def parse_export(path: Path) -> Iterator[Record]:
@@ -141,7 +142,7 @@ def parse_export(path: Path) -> Iterator[Record]:
     in_log = False
     for i, line in _iter_lines(path):
         if not in_log:
-            in_log = line == EXPORT_LOG_HEADER
+            in_log = line == LOG_HEADER
             continue
         m = _EXPORT.match(line) if line[:1] == "2" else None
         if not m:
@@ -170,4 +171,7 @@ def parse_export(path: Path) -> Iterator[Record]:
 
 
 def parse(path: Path) -> Iterator[Record]:
-    return parse_tandem(path) if Path(path).name.endswith("_tandem_log.txt") else parse_trio(path)
+    """Records of any supported log: an export (both sides), a tandem_log, or a Trio log."""
+    if Path(path).name.endswith("_tandem_log.txt"):
+        return parse_tandem(path)
+    return parse_export(path) if is_export(path) else parse_trio(path)

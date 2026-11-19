@@ -16,3 +16,15 @@ def test_extract_streams(tmp_path):
         "[2026-10-06T17:42:43-0400 INFO] TandemPumpManager.swift - fn()#1: unrelated\n"
     )
     assert list(extract_streams(p)) == [("2026-10-06 17:42:41.000000", good)]
+
+
+def test_extract_streams_from_export(tmp_path):
+    good = f"0101{REC}8aea"
+    p = tmp_path / "2026-11-17_trio_logs.txt"
+    p.write_text(
+        "Trio Logs\nDay: 2026-11-17\n\n== Log ==\n"
+        f"2026-11-17 15:53:38.218 -0500 Pump [delegate] [INFO] {LOG}HistoryLogStreamResponse(cargo={good}, "
+        "numberOfHistoryLogs=1, streamId=1)\n"
+        f"2026-11-17 15:53:39.000 -0500 Trio [Pump] HistoryLogStreamResponse(cargo={good}, numberOfHistoryLogs=1)\n"
+    )
+    assert list(extract_streams(p)) == [("2026-11-17 15:53:38.218000", good)]

@@ -295,7 +295,7 @@ def test_export_parses_sources_levels_and_continuations(tmp_path):
     assert [(r.src, r.level) for r in recs] == [("trio", "INFO"), ("trio", "WARNING"), ("tandem", "INFO"),
                                                 ("trio", "INFO"), ("trio", "INFO")]
     assert recs[1].extra == ["continued"] and recs[2].lineno == 11
-    (d,) = from_export(p, "Pat Doe")
+    (d,), _ = from_export(p, "Pat Doe")
     start = next(e for e in d.trio if e.kind == "app_start")
     assert (start.data["branch"], start.data["commit"], start.data["tandemkit"]) == ("feat/x", "abc1234", "def5678")
     assert [e.kind for e in d.trio if e.kind in ("loop_failed", "problem")] == ["loop_failed", "problem"]
@@ -320,7 +320,7 @@ def test_export_temp_basal_and_bolus_outcomes(tmp_path):
         xtrio("10:06:02", "Bolus enacted: 2.0 U, manual", "Bolus"),
         xtrio("10:07:00", "Loop finished in 1.2 s"),
     ]))
-    (d,) = from_export(p, "Pat Doe")
+    (d,), _ = from_export(p, "Pat Doe")
     tb = [e.data for e in d.trio if e.kind == "trio_temp_basal"]
     assert [(t["result"], t["rate"], t["duration_min"]) for t in tb] == [("succeeded", 0.85, 30), ("failed", 1.0, 30)]
     assert [(e.data["units"], e.data.get("manual")) for e in d.trio if e.kind == "trio_bolus"] == [(0.3, None), (2.0, True)]
@@ -329,3 +329,44 @@ def test_export_temp_basal_and_bolus_outcomes(tmp_path):
     assert "temp_basal.failed_but_enacted" in found
     assert kinds(run("bolus", d)) == []
     assert [e.kind for e in d.trio if e.kind == "loop_success"] == ["loop_success"]
+
+
+def test_discover_export_days_with_header_build(tmp_path):
+    from trio_logparser import analysis
+    from trio_logparser.dataset import discover
+
+    person = tmp_path / "Pat Doe"
+    (person / "headers").mkdir(parents=True)
+    (person / f"{DAY}_trio_logs.txt").write_text("Trio Logs\nDay: 2026-09-20\n\n== Log ==\n" + "".join([
+        xtrio("10:00:00", "Loop started, mode closed"),
+        xpump("10:00:01", "Setting temp basal at 0.8U/hr for 1800.0s"),
+        xtrio("10:00:02", "Temp basal enacted: 0.8 U/h for 30 min"),
+        xtrio("10:00:03", "Loop finished in 3.0 s"),
+    ]))
+    (person / f"{DAY}_log.txt").write_text(trio("09:00:00", "Loop succeeded"))  # shadowed old format
+    (person / "headers" / "2026-09-21_080000_trio_logs.txt").write_text(
+        "Trio Logs\nCreated: 2026-09-21 08:00:00 -0400\nCovers: last 3 days\n\n== App ==\n"
+        "Trio: 1.0.2 (1), dev version 1.0.2.9\nBranch: feat/x\nCommit: abc1234\nTandemKit: detached def5678\n"
+        "\n== Phone ==\niOS: 27\n")
+    (d,) = discover(tmp_path)
+    assert d.export_path.name == f"{DAY}_trio_logs.txt" and [p.name for p in d.ignored] == [f"{DAY}_log.txt"]
+    res = analysis.run(tmp_path)
+    (d,) = res.days
+    assert d.has_both and [e.kind for e in d.trio if e.kind.startswith("loop")] == ["loop_start", "loop_success"]
+    assert builds.build_at(d, datetime(2026, 9, 20, 10)) == builds.Build("1.0.2.9", "feat/x", "abc1234", "def5678")
+    assert run("temp_basal", d) == []
+
+
+def test_launch_in_window_beats_header_build(tmp_path):
+    from trio_logparser import analysis
+
+    person = tmp_path / "Pat Doe"
+    (person / "headers").mkdir(parents=True)
+    (person / f"{DAY}_trio_logs.txt").write_text("Trio Logs\nDay: 2026-09-20\n\n== Log ==\n" + xtrio(
+        "12:00:00", "Trio started: v1.0.2.8 (1) feat/x 1111111; TandemKit 2222222", "Lifecycle"))
+    (person / "headers" / "h.txt").write_text(
+        "Trio Logs\nCreated: 2026-09-21 08:00:00 -0400\nCovers: last 3 days\n\n== App ==\n"
+        "Trio: 1.0.2 (1), dev version 1.0.2.9\nBranch: feat/x\nCommit: abc1234\nTandemKit: detached def5678\n")
+    (d,) = analysis.run(tmp_path).days
+    assert builds.build_at(d, datetime(2026, 9, 20, 11)) is None  # before the launch: unknown
+    assert builds.build_at(d, datetime(2026, 9, 20, 13)).tandemkit == "2222222"

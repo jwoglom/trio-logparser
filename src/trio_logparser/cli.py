@@ -68,7 +68,8 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="trio-logs")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    o = sub.add_parser("organize", help="sort uploads into <dest>/<Person>/YYYY-MM-DD_<kind>.txt")
+    o = sub.add_parser("organize", help="sort uploads (Trio log exports, older log/tandem_log files) "
+                                        "into <dest>/<Person>/YYYY-MM-DD_<kind>.txt")
     o.add_argument("sources", nargs="+", help="upload folders, zips, or files (never modified)")
     o.add_argument("--dest", help="organized log root (default: $TRIO_LOGS_DIR)")
     o.add_argument("--person", help="person for files without a ' - <Person>' suffix")
@@ -77,8 +78,10 @@ def main(argv: list[str] | None = None) -> int:
     o.set_defaults(func=cmd_organize)
 
     h = sub.add_parser("history-jsonl",
-                       help="export the pump history logs in a tandem_log as TandemKit/pumpX2 JSONL")
-    h.add_argument("log", help="a tandem_log file")
+                       help="export the pump history logs in a Trio log export or tandem_log as "
+                            "TandemKit/pumpX2 JSONL")
+    h.add_argument("log", help="a Trio log export (raw, or an organized YYYY-MM-DD_trio_logs.txt) "
+                               "or an older tandem_log file")
     h.add_argument("-o", "--output", default="-", help="output .jsonl (default: stdout)")
     h.add_argument("--tandemkit-repo", help="TandemKit checkout (default: $TANDEMKIT_REPO)")
     h.add_argument("--tandemkit-rev", default="HEAD",

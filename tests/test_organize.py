@@ -164,3 +164,142 @@ def test_unresolved_person_requires_flag(tmp_path, capsys):
     assert main(["organize", str(tmp_path), "--dest", str(tmp_path / "out"), "--person", "me",
                  "--apply"]) == 0
     assert (tmp_path / "out" / "me" / "2026-09-20_log.txt").exists()
+
+
+# --------------------------------------------------------------------------- Trio log exports
+
+def xline(day: str, t: str, rest: str) -> str:
+    return f"{day} {t} -0400 {rest}\n"
+
+
+def export_bytes(created: str, lines: list[str], title: str = "Trio Logs", covers: str = "3 days",
+                 serial: str = "<pump-serial-1>") -> bytes:
+    header = (f"{title}\nCreated: {created} -0400\nCovers: last {covers}\n"
+              "Personal details such as your Nightscout address, passwords and device serial numbers have been removed.\n"
+              "\n== App ==\nTrio: 1.0.2 (1), dev version 1.0.2.9\nBranch: feat/x\nCommit: abc1234\n"
+              "TandemKit: detached def5678\n\n== Phone ==\niOS: Version 27.0\n"
+              f"\n== Pump ==\nName: Tandem Mobi\n* pumpSerial: {serial}\n")
+    return (header + "\n== Log ==\n" + "".join(lines)).encode()
+
+
+def pump(day: str, t: str, msg: str) -> str:
+    return xline(day, t, f"Pump [delegate] [INFO] TandemPumpManager.swift - fn()#1: {msg}")
+
+
+def app(day: str, t: str, msg: str) -> str:
+    return xline(day, t, f"Trio [Loop] {msg}")
+
+
+def organize_run(up, dest, *extra) -> int:
+    return main(["organize", str(up), "--dest", str(dest), "--apply", *extra])
+
+
+def test_export_split_into_days_with_header(tmp_path, capsys):
+    lines = [app("2026-09-19", "23:59:59.900", "Loop finished in 1.0 s"),
+             app("2026-09-20", "00:00:00.100", "Loop started, mode closed"),
+             xline("2026-09-20", "00:00:00.200", "Trio WARNING: [Storage] Reading failed: {"),
+             "    \"key\": 1\n",
+             pump("2026-09-21", "11:59:00.000", "Connected to pump!")]
+    data = export_bytes("2026-09-21 12:00:00", lines)
+    up = tmp_path / "up"
+    up.mkdir()
+    (up / "Trio Logs 2026-09-21 1200 - Pat Doe(1).zip").write_bytes(zip_bytes({
+        "Trio Logs 2026-09-21 1200/Trio Logs 2026-09-21 1200.txt": data,
+        "__MACOSX/Trio Logs 2026-09-21 1200/._Trio Logs 2026-09-21 1200.txt": b"junk",
+    }))
+    dest = tmp_path / "out"
+    assert organize_run(up, dest) == 0
+    person = dest / "Pat Doe"
+    assert sorted(p.name for p in person.iterdir()) == [
+        "2026-09-19_trio_logs.txt", "2026-09-20_trio_logs.txt", "2026-09-21_trio_logs.txt", "headers"]
+    assert (person / "2026-09-20_trio_logs.txt").read_text() == (
+        "Trio Logs\nDay: 2026-09-20\n\n== Log ==\n" + "".join(lines[1:4]))
+    header = (person / "headers" / "2026-09-21_120000_trio_logs.txt").read_bytes()
+    assert data.startswith(header) and data[len(header):].startswith(b"== Log ==\n")
+
+    # the unzipped folder copy (no person in its name) is the same data: nothing new
+    (up / "Trio Logs 2026-09-21 1200").mkdir()
+    (up / "Trio Logs 2026-09-21 1200" / "Trio Logs 2026-09-21 1200.txt").write_bytes(data)
+    capsys.readouterr()
+    assert organize_run(up, dest) == 0
+    assert "SAME: 4" in capsys.readouterr().out
+
+
+def test_overlapping_exports_merge_per_entry(tmp_path, capsys):
+    d1, d2 = "2026-09-20", "2026-09-21"
+    first = export_bytes("2026-09-21 12:00:00", [
+        app(d1, "10:00:00.000", "Loop started, mode closed"),
+        app(d1, "10:00:00.000", "Loop started, mode closed"),  # a real repeat in the same ms
+        pump(d1, "10:00:01.000", "Paired <pump-serial-1>"),
+        xline(d1, "10:00:02.000", "Pump [trace] [ble] only in the first export's process"),
+        app(d2, "11:00:00.000", "Loop finished in 1.0 s"),
+    ])
+    up = tmp_path / "up"
+    up.mkdir()
+    (up / "a - Pat Doe.txt").write_bytes(first)
+    dest = tmp_path / "out"
+    assert organize_run(up, dest) == 0
+
+    # later export: placeholders renumbered, the trace line gone, the 21st continues
+    second = export_bytes("2026-09-21 18:00:00", [
+        app(d1, "10:00:00.000", "Loop started, mode closed"),
+        app(d1, "10:00:00.000", "Loop started, mode closed"),
+        pump(d1, "10:00:01.000", "Paired <pump-serial-2>"),
+        app(d2, "11:00:00.000", "Loop finished in 1.0 s"),
+        app(d2, "17:00:00.000", "Loop finished in 1.2 s"),
+    ], serial="<pump-serial-2>")
+    (up / "b - Pat Doe.txt").write_bytes(second)
+    capsys.readouterr()
+    assert organize_run(up, dest) == 0
+    out = capsys.readouterr().out
+    assert "EXTEND   Pat Doe/2026-09-21_trio_logs.txt" in out
+    day1 = (dest / "Pat Doe" / f"{d1}_trio_logs.txt").read_text()
+    assert day1.count("Loop started") == 2 and "<pump-serial-1>" in day1 and "<pump-serial-2>" not in day1
+    assert "only in the first export's process" in day1
+    assert (dest / "Pat Doe" / f"{d2}_trio_logs.txt").read_text().endswith(
+        "Loop finished in 1.0 s\n" + app(d2, "17:00:00.000", "Loop finished in 1.2 s"))
+    assert len(list((dest / "Pat Doe" / "headers").iterdir())) == 2
+
+
+def test_pump_only_export_merges_into_full_day(tmp_path, capsys):
+    d = "2026-09-20"
+    full = [app(d, f"10:{m:02}:00.000", f"Loop finished in {m} s") for m in range(30)]
+    full += [pump(d, f"10:{m:02}:30.000", f"Writing message: X{m}Request(cargo=)") for m in range(30)]
+    full.sort()
+    up = tmp_path / "up"
+    up.mkdir()
+    (up / "full - Pat Doe.txt").write_bytes(export_bytes("2026-09-20 12:00:00", full))
+    dest = tmp_path / "out"
+    assert organize_run(up, dest) == 0
+    pump_only = sorted([line for line in full if " Pump " in line]
+                       + [xline(d, "10:05:31.000", "Pump [trace] [ble] extra trace")])
+    (up / "pump - Pat Doe.txt").write_bytes(export_bytes("2026-09-20 12:05:00", pump_only, title="Trio Pump Logs"))
+    capsys.readouterr()
+    assert organize_run(up, dest) == 0
+    out = capsys.readouterr().out
+    assert "MERGE    Pat Doe/2026-09-20_trio_logs.txt" in out and "+1 entries from pump - Pat Doe.txt" in out
+    text = (dest / "Pat Doe" / f"{d}_trio_logs.txt").read_text()
+    assert text.index("X5Request") < text.index("extra trace") < text.index("Loop finished in 6 s")
+    assert (dest / "Pat Doe" / "headers" / "2026-09-20_120500_trio_pump_logs.txt").exists()
+
+
+def test_export_from_another_phone_conflicts(tmp_path, capsys):
+    d = "2026-09-20"
+    up = tmp_path / "up"
+    up.mkdir()
+    mine = [app(d, f"10:{m:02}:00.000", f"Loop finished in {m} s") for m in range(30)]
+    theirs = [app(d, f"10:{m:02}:00.500", f"Loop finished in {m}.5 s") for m in range(30)]
+    (up / "a - Pat Doe.txt").write_bytes(export_bytes("2026-09-20 12:00:00", mine))
+    dest = tmp_path / "out"
+    assert organize_run(up, dest) == 0
+    before = (dest / "Pat Doe" / f"{d}_trio_logs.txt").read_bytes()
+    (up / "b - Pat Doe.txt").write_bytes(export_bytes("2026-09-20 12:30:00", theirs))
+    capsys.readouterr()
+    assert organize_run(up, dest) == 1
+    assert "CONFLICT Pat Doe/2026-09-20_trio_logs.txt" in capsys.readouterr().out
+    assert (dest / "Pat Doe" / f"{d}_trio_logs.txt").read_bytes() == before
+
+
+def test_export_kind_comes_from_content():
+    assert organize.Source("p", "whatever.txt", b"Trio CGM Logs\nCreated: x\n", "o").kind == "trio_logs"
+    assert organize.Source("p", "log.txt", b"Trio Logs\n", "o").kind == "trio_logs"

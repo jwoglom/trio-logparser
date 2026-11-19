@@ -11,8 +11,9 @@ from pathlib import Path
 from . import analysis, checks, known
 from .builds import Repo, build_at
 from .dataset import alias, discover, from_export
+from .export import TITLES
 from .normalize import mask
-from .parse import EXPORT_MAGIC, is_export
+from .parse import is_export
 
 SEV_ORDER = {"high": 0, "warn": 1, "info": 2}
 RECENT_DAYS = 7  # builds committed within this many days of the newest one count as "recent"
@@ -23,7 +24,7 @@ EXPORT_PERSON = "export"
 
 def _common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--dest", help="organized log root (default: $TRIO_LOGS_DIR)")
-    p.add_argument("--file", help="analyze one 'Trio Logs' export file instead of the organized tree")
+    p.add_argument("--file", help="analyze one Trio log export file instead of the organized tree")
     p.add_argument("--person", action="append",
                    help="limit to a person (name or alias); repeatable. With --file: label for its person")
     p.add_argument("--since", help="first day, YYYY-MM-DD")
@@ -42,10 +43,11 @@ class Ctx:
         if args.file:
             path = Path(args.file).expanduser()
             if not is_export(path):
-                sys.exit(f"error: {path} is not a 'Trio Logs' export (first line must be '{EXPORT_MAGIC}')")
+                sys.exit(f"error: {path} is not a Trio log export (first line must be one of {', '.join(TITLES)})")
             person = args.person[0] if args.person else EXPORT_PERSON
+            days, header = from_export(path, person)
             self.res = analysis.run(None, since=args.since, until=args.until, only=only,
-                                    loaded=from_export(path, person))
+                                    loaded=days, headers={person: [header]})
         else:
             self.res = analysis.run(logs_root(args), args.person, args.since, args.until, only)
         self.repo = Repo(args.tandemkit_repo)
@@ -88,9 +90,16 @@ def _issue_tag(issue: known.Issue | None) -> str:
 def cmd_scan(args) -> int:
     c = Ctx(args, args.check)
     res = c.res
-    both = sum(1 for d in res.days if d.trio_path and d.tandem_path)
-    print(f"{len({d.person for d in res.days})} people, {len(res.days)} days ({both} with both logs), "
-          f"{min(d.day for d in res.days)} → {max(d.day for d in res.days)}")
+    if not res.days:
+        print("no log days found")
+        return 0
+    both = sum(1 for d in res.days if d.has_both)
+    exports = sum(1 for d in res.days if d.export_path)
+    print(f"{len({d.person for d in res.days})} people, {len(res.days)} days ({both} with both logs, "
+          f"{exports} from exports), {min(d.day for d in res.days)} → {max(d.day for d in res.days)}")
+    if shadowed := [d for d in res.days if d.ignored]:
+        print(f"{len(shadowed)} day(s) also have old-format logs; analyzed the export only: "
+              + ", ".join(f"{c.who(d.person)} {d.day}" for d in shadowed[:5]) + (" …" if len(shadowed) > 5 else ""))
     print(f"newest TandemKit build: {c.label(c.newest)}; 'recent' = builds within {RECENT_DAYS} days of it "
           f"({len(c.recent)})\n")
 
@@ -285,5 +294,5 @@ def add_commands(sub) -> None:
     p.add_argument("-C", "--context", type=int, default=8)
     p.add_argument("--width", type=int, default=240)
     p.add_argument("--dest")
-    p.add_argument("--file", help="a 'Trio Logs' export file (findings run with --file point into it)")
+    p.add_argument("--file", help="a Trio log export file (findings run with --file point into it)")
     p.set_defaults(func=cmd_show)

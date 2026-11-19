@@ -6,7 +6,7 @@ from pathlib import Path
 
 from . import builds as bld
 from . import checks
-from .dataset import Day, discover, load_all
+from .dataset import Day, discover, load_all, load_headers
 from .normalize import template
 
 
@@ -51,8 +51,9 @@ def build_of(d: Day, ts) -> bld.Build | None:
 
 def run(root: Path | None, people: list[str] | None = None, since: str | None = None,
         until: str | None = None, only: list[str] | None = None,
-        loaded: list[Day] | None = None) -> Result:
-    """Analyze the organized tree at ``root``, or already-loaded days (``loaded``, e.g. an export)."""
+        loaded: list[Day] | None = None, headers: dict | None = None) -> Result:
+    """Analyze the organized tree at ``root``, or already-loaded days (``loaded``, e.g. from
+    ``dataset.from_export``) with their export ``headers`` (person -> [Header])."""
     def in_range(d: Day) -> bool:
         return (not since or d.day >= since) and (not until or d.day <= until)
 
@@ -61,7 +62,8 @@ def run(root: Path | None, people: list[str] | None = None, since: str | None = 
     else:
         days = sorted(load_all([d for d in discover(root, people) if in_range(d)]),
                       key=lambda d: (d.person, d.day))
-    bld.assign(days)
+        headers = load_headers(root, people)
+    bld.assign(days, headers)
 
     findings: list[checks.Finding] = []
     families = {o.split(".")[0] for o in only or ()}

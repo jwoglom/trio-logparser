@@ -1,21 +1,33 @@
 """Organize raw tester uploads into per-person folders of one-file-per-day logs.
 
 Input is whatever testers upload: loose files, zips (possibly nested), or folders. Files are
-Trio app logs (``log.txt`` / ``log_prev.txt``) and TandemKit logs (``tandem_log.txt`` /
-``tandem_log_prev.txt``), often renamed by the upload form to ``<name> - <Person>(N).<ext>``
-and by macOS to ``log 2.txt``, ``log_prev 3.txt`` and so on.
+Trio log exports (Trio 1.0.2+: ``Trio Logs <date> <time>.txt``, usually zipped in a folder of
+the same name; also "Trio Pump Logs" / "Trio CGM Logs"), and from older builds Trio app logs
+(``log.txt`` / ``log_prev.txt``) and TandemKit logs (``tandem_log.txt`` /
+``tandem_log_prev.txt``). The upload form renames files to ``<name> - <Person>(N).<ext>``, and
+macOS to ``log 2.txt``, ``log_prev 3.txt`` and so on. Exports are recognized by their first
+line, whatever their name.
 
 Output layout::
 
-    <dest>/<Person>/YYYY-MM-DD_log.txt
-    <dest>/<Person>/YYYY-MM-DD_tandem_log.txt
-    <dest>/<Person>/other/<original name>      # crash reports, Loop reports, named logs
+    <dest>/<Person>/YYYY-MM-DD_trio_logs.txt     # that day's lines of every export, merged
+    <dest>/<Person>/headers/<created>_<variant>.txt   # each export's header, verbatim
+    <dest>/<Person>/YYYY-MM-DD_log.txt           # older builds
+    <dest>/<Person>/YYYY-MM-DD_tandem_log.txt    # older builds
+    <dest>/<Person>/other/<original name>        # crash reports, Loop reports, named logs
 
 Each output day is derived from the timestamps *inside* the file, not its name. ``_prev`` files
-are simply the previous day's log, so they land on their own day naturally.
+are simply the previous day's log, so they land on their own day naturally. An export covers
+several days and is split into one file per local day; each day file is itself a valid export
+(``Trio Logs`` / ``Day:`` / ``== Log ==``), so every tool reads it like a raw export.
 
-When several versions of the same person/day/kind exist (re-uploads, mid-day snapshots, the
-already-organized file in ``dest``), they are reconciled:
+Export days are reconciled per log entry (``export.merge``): a day's versions are unioned in
+time order, ignoring per-export placeholder numbering, so overlapping exports, pump- or CGM-only
+exports, and re-uploads add only what is new. Versions that overlap in time but share few
+entries are reported as a conflict.
+
+When several versions of the same person/day/kind of an *older* log exist (re-uploads, mid-day
+snapshots, the already-organized file in ``dest``), they are reconciled:
 
 * identical copies collapse into one;
 * a version contained in a longer one is dropped: an earlier snapshot of the same day (a byte
@@ -38,7 +50,11 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import export
+
 KINDS = ("log", "tandem_log")
+EXPORT_KIND = "trio_logs"
+HEADERS_DIR = "headers"
 
 # "<base> - <Person>(3).txt" as produced by the Google Form file-upload question, optionally
 # with a macOS " 2" duplicate suffix ("Archive - <Person>(6) 2" when unzipped twice)
@@ -73,13 +89,15 @@ class Source:
 
     @property
     def kind(self) -> str | None:
+        if export.is_export_bytes(self.data):
+            return EXPORT_KIND
         m = _ROTATED_LOG.match(self.name) or _NAMED_LOG.match(self.name)
         return m.group("kind") if m else None
 
     @property
     def is_descriptively_named(self) -> bool:
         """A log saved under a custom name; also kept verbatim in ``other/`` for its label."""
-        return self.kind is not None and not _ROTATED_LOG.match(self.name)
+        return self.kind in KINDS and not _ROTATED_LOG.match(self.name)
 
 
 def split_person(filename: str) -> tuple[str, str | None]:
@@ -220,11 +238,24 @@ def plan(sources: list[Source], dest: Path) -> list[Action]:
     dest = Path(dest)
     actions: list[Action] = []
     groups: dict[tuple[str, str, str], list[tuple[bytes, str]]] = collections.defaultdict(list)
+    export_days: dict[tuple[str, str], list[tuple[list[export.Entry], str]]] = collections.defaultdict(list)
     others: dict[Path, list[Source]] = collections.defaultdict(list)
 
     for s in sources:
         assert s.person, s.origin
         kind = s.kind
+        if kind == EXPORT_KIND:
+            try:
+                header, entries = export.split(export.decode(s.data))
+            except ValueError as e:
+                actions.append(Action("ERROR", dest / s.person, notes=[f"{s.origin}: {e}"]))
+                continue
+            name = header.file_name
+            others[dest / s.person / HEADERS_DIR / name].append(
+                Source(s.person, name, header.text.encode("utf-8", "surrogateescape"), s.origin))
+            for day, day_entries in export.by_day(entries).items():
+                export_days[(s.person, day)].append((day_entries, s.origin))
+            continue
         if kind is None or s.is_descriptively_named:
             others[dest / s.person / "other" / s.name].append(s)
         if kind is None:
@@ -255,6 +286,9 @@ def plan(sources: list[Source], dest: Path) -> list[Action]:
         else:
             actions.append(Action("MERGE", out, data, notes))
 
+    for (person, day), versions in sorted(export_days.items()):
+        actions.append(_plan_export_day(dest / person / f"{day}_{EXPORT_KIND}.txt", day, versions))
+
     for out, srcs in sorted(others.items()):
         datas = {s.data for s in srcs}
         if out.exists():
@@ -267,6 +301,32 @@ def plan(sources: list[Source], dest: Path) -> list[Action]:
         else:
             actions.append(Action("NEW", out, srcs[0].data, origins))
     return actions
+
+
+def _plan_export_day(out: Path, day: str, versions: list[tuple[list[export.Entry], str]]) -> Action:
+    existing = out.read_bytes() if out.exists() else None
+    if existing is not None:
+        try:
+            _, current = export.split(export.decode(existing))
+        except ValueError as e:
+            return Action("ERROR", out, notes=[f"existing file: {e}"])
+        versions = [(current, EXISTING), *versions]
+    else:
+        versions = sorted(versions, key=lambda v: -len(v[0]))  # the fullest version is the base
+    merged = export.merge(versions)
+    base = versions[0][1]
+    notes = [f"from {base}" if base != EXISTING else "into the existing file"]
+    for origin, n in list(merged.added.items())[1:]:
+        notes.append(f"+{n} entries from {origin}" if n else f"superseded (already contained): {origin}")
+    if merged.conflict:
+        return Action("CONFLICT", out, notes=[merged.conflict, *notes])
+    data = export.day_file(day, merged.entries)
+    if existing is None:
+        contributing = sum(1 for n in merged.added.values() if n)
+        return Action("MERGE" if contributing > 1 else "NEW", out, data, notes)
+    if data == existing:
+        return Action("SAME", out)
+    return Action("EXTEND" if data.startswith(existing) else "MERGE", out, data, notes)
 
 
 WRITES = {"NEW", "EXTEND", "MERGE"}

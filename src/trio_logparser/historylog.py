@@ -1,6 +1,12 @@
-"""Export the pump history logs captured in a tandem_log as JSONL.
+"""Export the pump history logs captured in a Trio log export (or an older tandem_log) as JSONL.
 
-TandemKit logs every history-log stream packet it receives:
+TandemKit logs every history-log stream packet it receives; in a Trio log export (raw, or an
+organized ``YYYY-MM-DD_trio_logs.txt`` day) as a Pump line::
+
+    2026-11-17 15:53:38.218 -0500 Pump [delegate] [INFO] TandemPeripheralManager.swift -
+        handleHistoryLogStreamPacket(_:)#677: Received stream message: HistoryLogStreamResponse(cargo=0301…, …)
+
+and in an older tandem_log as::
 
     [2026-10-06T17:42:41-0400 INFO] TandemPeripheralManager.swift - handleHistoryLogStreamPacket(_:)#578:
         Received stream message: HistoryLogStreamResponse(cargo=0301…, numberOfHistoryLogs=3, streamId=1, …)
@@ -26,8 +32,9 @@ from importlib import resources
 from pathlib import Path
 
 _STREAM = re.compile(
-    r"^\[(?P<date>\d{4}-\d{2}-\d{2})T(?P<time>\d{2}:\d{2}:\d{2})[+-]\d{4} \w+\] .*?"
-    r"Received (?:stream )?message: HistoryLogStreamResponse\(cargo=(?P<cargo>[0-9a-fA-F]*), "
+    r"^(?:\[(?P<date>\d{4}-\d{2}-\d{2})T(?P<time>\d{2}:\d{2}:\d{2})[+-]\d{4} \w+\]"  # tandem_log
+    r"|(?P<xdate>\d{4}-\d{2}-\d{2}) (?P<xtime>\d{2}:\d{2}:\d{2})(?:\.(?P<ms>\d+))? [+-]\d{4} Pump)"  # export
+    r" .*?Received (?:stream )?message: HistoryLogStreamResponse\(cargo=(?P<cargo>[0-9a-fA-F]*), "
     r"numberOfHistoryLogs=(?P<n>\d+)"
 )
 
@@ -54,9 +61,10 @@ class ExportError(Exception):
 def extract_streams(path: Path) -> Iterator[tuple[str, str]]:
     """``(timestamp, cargo hex)`` for every complete HistoryLogStreamResponse line, in log order.
 
-    The timestamp is the log line's local wall-clock time in the export's
-    ``yyyy-MM-dd HH:mm:ss.SSSSSS`` format (the log only has whole seconds). Lines whose cargo
-    doesn't hold the advertised number of logs (e.g. torn by the logger race) are skipped.
+    The timestamp is the log line's local wall-clock time in the JSONL export's
+    ``yyyy-MM-dd HH:mm:ss.SSSSSS`` format (milliseconds from a Trio log export; an older
+    tandem_log only has whole seconds). Lines whose cargo doesn't hold the advertised number of
+    logs (e.g. torn by the old logger race) are skipped.
     """
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -69,7 +77,10 @@ def extract_streams(path: Path) -> Iterator[tuple[str, str]]:
             n = int(m["n"])
             if len(cargo) < 4 or int(cargo[:2], 16) != n or len(cargo) < 2 * (2 + 26 * n):
                 continue
-            yield f"{m['date']} {m['time']}.000000", cargo.lower()
+            if m["xdate"]:
+                yield f"{m['xdate']} {m['xtime']}.{(m['ms'] or '')[:6]:0<6}", cargo.lower()
+            else:
+                yield f"{m['date']} {m['time']}.000000", cargo.lower()
 
 
 def _git(repo: Path, *args: str) -> str:
