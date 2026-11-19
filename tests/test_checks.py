@@ -1,5 +1,6 @@
 """Checks over synthetic logs. Every log line here is made up."""
 
+import struct
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -329,3 +330,190 @@ def test_export_temp_basal_and_bolus_outcomes(tmp_path):
     assert "temp_basal.failed_but_enacted" in found
     assert kinds(run("bolus", d)) == []
     assert [e.kind for e in d.trio if e.kind == "loop_success"] == ["loop_success"]
+
+
+# --------------------------------------------------------------------------- dose dates & pump history
+
+RAW_BOLUS = "0101" + "78563412" + "01010000"  # HistoryLogSyncIdentifier: bolus, serial 0x12345678, bolusId 257
+RAW_EXTENDED = "0104" + "78563412" + "01010000"
+
+
+def misdated(t: str, kind: str, raw: str, problem: str, sent: str) -> str:
+    return tandem(t, f"Misdated {kind} {raw} {problem}; sent as {sent}", "ERROR")
+
+
+def start_ahead(start: str, phone: str = "2026-09-20 04:10:00 +0000") -> tuple[str, str]:
+    return f"starts at {start}, ahead of the phone's {phone}", f"{phone} to {start}"
+
+
+def history_record(type_id: int, pump_time: datetime, seq: int, payload: bytes) -> bytes:
+    secs = int((pump_time - datetime(2008, 1, 1)).total_seconds())
+    return struct.pack("<HII", 0x1000 | type_id, secs, seq) + payload.ljust(16, b"\0")
+
+
+def bolus_completed(bolus_id: int, units: float, pump_time: datetime, seq: int = 1) -> bytes:
+    return history_record(20, pump_time, seq, struct.pack("<HHfff", 3, bolus_id, 0.0, units, units))
+
+
+def bolex_activated(bolus_id: int, units: float, pump_time: datetime, seq: int = 2) -> bytes:
+    return history_record(59, pump_time, seq, struct.pack("<HBxff", bolus_id, 1, 0.0, units))
+
+
+def stream_message(*records: bytes) -> str:
+    cargo = (bytes([len(records), 7]) + b"".join(records) + b"\xab\xcd").hex()
+    return (f"Received stream message: HistoryLogStreamResponse(cargo={cargo}, "
+            f"numberOfHistoryLogs={len(records)}, streamId=7, historyLogStreamBytes=[], historyLogs=[])")
+
+
+def stream(t: str, *records: bytes) -> str:
+    return tandem(t, stream_message(*records))
+
+
+def test_bolus_records_decode_completions_and_extended_parts():
+    from trio_logparser.historylog import bolus_records
+
+    when = datetime(2026, 3, 1, 8, 30)
+    basal = history_record(279, when, 3, b"")
+    cargo = (bytes([3, 7]) + bolus_completed(257, 1.25, when) + basal + bolex_activated(258, 0.6, when)).hex()
+    secs = int((when - datetime(2008, 1, 1)).total_seconds())
+    assert bolus_records(cargo) == [
+        {"type": 20, "bolus_id": 257, "pump_secs": secs, "seq": 1, "units": 1.25},
+        {"type": 59, "bolus_id": 258, "pump_secs": secs, "seq": 2, "units": 0.6}]
+    assert bolus_records(cargo[:-8]) == [] and bolus_records("zz") == []
+
+
+@pytest.mark.parametrize("kind, start, expected", [
+    ("bolus", "2030-01-01 00:00:00 +0000", ("misdated_dose.start_ahead", "high")),
+    ("tempBasal", "2030-01-01 00:00:00 +0000", ("misdated_dose.start_ahead", "high")),
+    ("bolus", "2026-09-20 04:15:00 +0000", ("misdated_dose.start_ahead", "warn")),  # a 5 min nudge
+    ("suspend", "2030-01-01 00:00:00 +0000", ("misdated_dose.start_ahead", "warn")),
+])
+def test_misdated_dose_start_ahead(tmp_path, kind, start, expected):
+    [f] = run("misdated_dose", day(tmp_path, [], [misdated("00:10:00", kind, RAW_BOLUS, *start_ahead(start))]))
+    assert (f.check, f.severity) == expected
+    assert "bolusId 257" in f.summary and "78563412" not in f.summary and RAW_BOLUS not in str(f.data)
+    assert ("ending 2030-01-01" in f.summary) == start.startswith("2030")
+
+
+def test_misdated_dose_is_one_finding_per_dose_however_often_resent(tmp_path):
+    problem, sent = start_ahead("2030-01-01 00:00:00 +0000")
+    d = day(tmp_path, [], [misdated("00:10:00", "bolus", RAW_BOLUS, problem, sent)]
+            + [misdated(f"00:{m}:00", "bolus", RAW_EXTENDED, problem, sent) for m in (10, 15, 20)])
+    found = run("misdated_dose", d)
+    assert [(f.data["dose"], f.data["sends"]) for f in found] == [("bolusId 257", 1), ("extended bolusId 257", 3)]
+    assert "(3 times)" in found[1].summary
+
+
+def test_misdated_dose_other_repairs_and_unknown_wording(tmp_path):
+    sent = "2026-09-20 04:00:00 +0000 to 2026-09-20 04:00:00 +0000"
+    d = day(tmp_path, [], [
+        misdated("00:10:00", "tempBasal", "", "ends at 2026-09-20 04:00:00 +0000, "
+                 "before it starts at 2026-09-20 04:30:00 +0000", sent),
+        misdated("00:11:00", "bolus", RAW_BOLUS, "delivered -0.5 U", sent),
+        misdated("00:12:00", "resume", "0103" + "78563412" + "09000000", "is upside down", sent),
+    ])
+    found = run("misdated_dose", d)
+    assert kinds(found) == ["misdated_dose.ends_before_start", "misdated_dose.negative_delivery", "misdated_dose.other"]
+    assert {f.severity for f in found} == {"warn"}
+    assert "ended 30 min before it started" in found[0].summary and "no pump id" in found[0].summary
+    assert "history record 9" in found[2].summary
+
+
+@pytest.mark.parametrize("pump_time, expected", [
+    (datetime(2026, 3, 1, 8, 30), ["history_bolus.stale"]),   # 203 days before the phone's clock
+    (datetime(2033, 1, 1, 0, 0), ["history_bolus.stale"]),    # a pump clock years ahead
+    (datetime(2026, 9, 19, 22, 0), []),                       # a pump-button bolus two hours ago
+])
+def test_history_bolus_report_after_stale_records(tmp_path, pump_time, expected):
+    d = day(tmp_path, [], [
+        tandem("00:10:00", "Backfilling history 100-354 (255 entries)"),
+        stream("00:10:01", bolus_completed(257, 2.0, pump_time), bolex_activated(257, 1.5, pump_time)),
+        tandem("00:10:03", "Reporting 2 bolus event(s) from pump history"),
+    ])
+    found = run("history_bolus", d)
+    assert kinds(found) == expected
+    if found:
+        assert found[0].severity == "high" and found[0].data["reported"] == 2
+        assert "bolusId 257 2 U" in found[0].summary and "extended bolusId 257 1.5 U" in found[0].summary
+
+
+def test_history_bolus_report_ignores_stale_records_read_long_before(tmp_path):
+    d = day(tmp_path, [], [
+        stream("00:10:01", bolus_completed(257, 2.0, datetime(2026, 3, 1, 8, 30))),
+        tandem("00:30:00", "Reporting 1 bolus event(s) from pump history"),
+    ])
+    assert run("history_bolus", d) == []
+
+
+def ratchet_step(hour: int, last: int) -> list[str]:
+    return [tandem(f"{hour:02}:00:00", f"Backfilling history {5000 + hour}-{5000 + hour} (1 entries)"),
+            tandem(f"{hour:02}:00:01", "Pruned 255 expired history logs from the session store"),
+            tandem(f"{hour:02}:00:02", f"Backfilling history {last - 254}-{last} (255 entries)")]
+
+
+def test_history_walk_stepping_deeper_after_each_prune(tmp_path):
+    lines = [line for hour, last in ((1, 4000), (2, 3745), (3, 3490)) for line in ratchet_step(hour, last)]
+    [f] = run("history_backfill", day(tmp_path, [], lines))
+    assert (f.check, f.severity, f.data) == ("history_backfill.prune_ratchet", "warn", {"steps": 3, "lowest": 3236})
+    assert "01:00–03:00" in f.summary
+    assert run("history_backfill", day(tmp_path, [], lines[:6])) == []
+
+
+def test_history_prune_followed_by_new_entries_is_no_step(tmp_path):
+    lines = [tandem("00:55:00", "Backfilling history 5000-5010 (11 entries)")]
+    for hour in (1, 2, 3, 4):  # e.g. the history viewer's old records pruned, then a long gap's worth read
+        lines += [tandem(f"{hour:02}:00:00", "Pruned 40 expired history logs from the session store"),
+                  tandem(f"{hour:02}:00:01", f"Backfilling history {5000 + 300 * hour}-{5299 + 300 * hour} (300 entries)")]
+    assert run("history_backfill", day(tmp_path, [], lines)) == []
+
+
+@pytest.mark.parametrize("line, expected", [
+    ("didAdjustPumpClockBy 217067769.0", ("high", "+2512.36 days")),
+    ("didAdjustPumpClockBy -300.4", ("warn", "-300s")),
+    ("didAdjustPumpClockBy 3.0", None),
+])
+def test_pump_clock_adjusted(tmp_path, line, expected):
+    found = [f for f in run("pump_clock", day(tmp_path, [trio("00:10:00", line)])) if f.check == "pump_clock.adjusted"]
+    if expected is None:
+        assert found == []
+    else:
+        assert (found[0].severity, found[0].src) == (expected[0], "trio") and expected[1] in found[0].summary
+
+
+def test_mask_hides_the_pump_serial_inside_a_dose_raw():
+    from trio_logparser.normalize import mask
+
+    assert mask(f"Misdated bolus {RAW_BOLUS} starts at") == "Misdated bolus 0101<SN>01010000 starts at"
+    assert mask(f"eventRaw {RAW_EXTENDED}, tempPercent 0%") == "eventRaw 0104<SN>01010000, tempPercent 0%"
+    longer = "0101" + "78563412" * 4
+    assert mask(f"bytes {longer}") == f"bytes {longer}"
+
+
+def test_known_issue_ties_misdated_starts_to_the_new_checks():
+    problem, sent = start_ahead("2030-01-01 00:00:00 +0000")
+    msg = f"Misdated bolus {RAW_BOLUS} {problem}; sent as {sent}"
+    assert known.scan("tandem", msg) == [("stale-history-dose-sent-as-now", "signature")]
+    assert known.scan("tandem", f"Misdated bolus {RAW_BOLUS} delivered -1 U; sent as {sent}") == []
+    assert known.for_check("misdated_dose.start_ahead").id == "stale-history-dose-sent-as-now"
+    assert known.for_check("history_bolus.stale").id == "stale-history-dose-sent-as-now"
+    assert known.for_check("misdated_dose.ends_before_start") is None
+
+
+def test_export_flags_history_doses_sent_as_now(tmp_path):
+    from trio_logparser.dataset import from_export
+
+    problem, sent = start_ahead("2030-01-01 00:00:00 +0000", "2026-09-20 14:00:03 +0000")
+    packet = stream_message(bolus_completed(257, 2.0, datetime(2026, 3, 1, 8, 30)))
+    p = tmp_path / "Trio Logs.txt"
+    p.write_text(export([
+        xtrio("09:50:00", "Pump clock adjusted by 217067769 s", "Pump"),
+        xpump("10:00:00", "Backfilling history 100-354 (255 entries)"),
+        xpump("10:00:01", packet),
+        xpump("10:00:03", "Reporting 1 bolus event(s) from pump history"),
+        xpump("10:00:03", f"Misdated bolus {RAW_BOLUS} {problem}; sent as {sent}", "ERROR"),
+    ]))
+    (d,) = from_export(p, "Pat Doe")
+    found = [f for name in ("pump_clock", "history_bolus", "misdated_dose") for f in run(name, d)]
+    assert [(f.check, f.severity) for f in found] == [
+        ("pump_clock.adjusted", "high"), ("history_bolus.stale", "high"), ("misdated_dose.start_ahead", "high")]
+    assert [f.lineno for f in found] == [8, 11, 12]

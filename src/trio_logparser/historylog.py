@@ -15,9 +15,11 @@ the working tree is never touched) and cached per TandemKit commit.
 from __future__ import annotations
 
 import glob
+import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -49,6 +51,45 @@ _DECL = r"\b(?:class|struct|enum|protocol|typealias|func|let|var)\s+{}\b"
 
 class ExportError(Exception):
     pass
+
+
+# A stream packet's cargo is a count byte, a stream id byte, then 26 bytes per history log: type id
+# (low 12 bits), pump seconds, sequence number, 16 of payload.
+RECORD_BYTES = 26
+BOLUS_COMPLETED = 20
+BOLEX_ACTIVATED = 59
+
+
+def bolus_records(cargo: str) -> list[dict]:
+    """The bolus completions and extended-bolus activations in a stream packet's cargo.
+
+    The only records decoded here rather than by TandemKit's own classes: the checks need what the
+    pump stamped a bolus with on machines without a Swift toolchain. Offsets are those of
+    TandemKit's ``BolusCompletedHistoryLog`` and ``BolexActivatedHistoryLog``. ``units`` is what the
+    completion delivered or the extended part was programmed for; ``pump_secs`` counts from
+    2008-01-01 on the pump's wall clock. A cargo short of its advertised count yields nothing.
+    """
+    try:
+        data = bytes.fromhex(cargo)
+    except ValueError:
+        return []
+    if len(data) < 2 or len(data) < 2 + RECORD_BYTES * data[0]:
+        return []
+    out = []
+    for i in range(data[0]):
+        rec = data[2 + RECORD_BYTES * i: 2 + RECORD_BYTES * (i + 1)]
+        type_id = struct.unpack_from("<H", rec)[0] & 0x0FFF
+        if type_id == BOLUS_COMPLETED:
+            bolus_id = struct.unpack_from("<H", rec, 12)[0]
+        elif type_id == BOLEX_ACTIVATED:
+            bolus_id = struct.unpack_from("<H", rec, 10)[0]
+        else:
+            continue
+        pump_secs, seq = struct.unpack_from("<II", rec, 2)
+        units = struct.unpack_from("<f", rec, 18)[0]
+        out.append({"type": type_id, "bolus_id": bolus_id, "pump_secs": pump_secs, "seq": seq,
+                    "units": round(units, 3) if math.isfinite(units) else None})
+    return out
 
 
 def extract_streams(path: Path) -> Iterator[tuple[str, str]]:

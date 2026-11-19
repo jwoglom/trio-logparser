@@ -22,6 +22,8 @@ _MASK = [
     (re.compile(r"(?i)\b(serial(?:Number)?[=:]\s*)\w+"), r"\1<SN>"),
     (re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"), "<EMAIL>"),
     (re.compile(r"cargo=[0-9a-fA-F]{16,}"), "cargo=…"),
+    # a TandemKit dose's raw (HistoryLogSyncIdentifier): version, scheme, pump serial, pump id
+    (re.compile(r"(?<![0-9a-fA-F])(010[1-5])[0-9a-fA-F]{8}([0-9a-fA-F]{8})(?![0-9a-fA-F])"), r"\1<SN>\2"),
 ]
 
 

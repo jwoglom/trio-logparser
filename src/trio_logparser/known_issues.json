@@ -1461,5 +1461,25 @@
   "checks": [],
   "strength": "suggestive",
   "notes": "Open as of 2026-10-04 (TandemKit #508)."
+ },
+ {
+  "id": "stale-history-dose-sent-as-now",
+  "pr": null,
+  "merge_sha": null,
+  "fix_sha": null,
+  "merged_at": null,
+  "title": "History doses stamped before a pump reset are sent to the host as starting now",
+  "issues": [],
+  "symptom": "When the pump's clock is set after a reset (a pump out of shelf mode reads 2008, then 2020), TandemKit adds the change to records the pump stamped before the reset, which lands them in the future, and HostDoseDates sends each to the host as a dose starting now: boluses given long before show up as fresh insulin.",
+  "log_signature": "^Misdated \\w+ [0-9a-f]* ?starts at .+, ahead of the phone's ",
+  "signature_kind": "regex_tandem",
+  "fixed_marker_regex": null,
+  "confidence": "high",
+  "checks": [
+   "misdated_dose.start_ahead",
+   "history_bolus.stale"
+  ],
+  "strength": "suggestive",
+  "notes": "Open as of 2026-11-19, no TandemKit issue filed yet; seen on 781bedc (next-dev). HistoryTimestampReconciler sums every later clock change into every earlier record, reportHistoryBoluses floors a dose's date from below only, and the session store's 90-day prune removes the record the walk backward stopped at, so it reads a slice deeper each hour (history_backfill.prune_ratchet)."
  }
 ]
