@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from . import known
+from .historylog import bolus_records
 from .parse import TORN, Record
 
 
@@ -46,6 +47,32 @@ def _value(v: str) -> float | int | str:
 def fields(body: str) -> dict:
     """``"cargo=.., status=0, tempRateId=6028"`` -> ``{"status": 0, "tempRateId": 6028}``."""
     return {k: _value(v) for k, v in _KV.findall(body) if k != "cargo"}
+
+
+_SWIFT_DATE = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \+0000"  # Date's description: always UTC
+
+
+def swift_date(s: str) -> datetime:
+    """``"2026-09-20 04:05:06 +0000"`` -> that UTC instant, naive."""
+    return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+
+
+_MISDATED = [
+    ("start_ahead", re.compile(rf"starts at (?P<a>{_SWIFT_DATE}), ahead of the phone's (?P<b>{_SWIFT_DATE})")),
+    ("ends_before_start", re.compile(rf"ends at (?P<b>{_SWIFT_DATE}), before it starts at (?P<a>{_SWIFT_DATE})")),
+]
+_NEGATIVE_UNITS = re.compile(r"delivered (-\d+(?:\.\d+)?) U")
+
+
+def misdated_problems(text: str) -> dict:
+    """What HostDoseDates found wrong with a dose: ``{"start_ahead": 3600.0}`` is a start an hour
+    ahead of the phone, ``ends_before_start`` the seconds its end fell short of its start, and
+    ``negative_delivery`` the units."""
+    out = {kind: (swift_date(m["a"]) - swift_date(m["b"])).total_seconds()
+           for kind, rx in _MISDATED if (m := rx.search(text))}
+    if m := _NEGATIVE_UNITS.search(text):
+        out["negative_delivery"] = float(m[1])
+    return out
 
 
 # (kind, regex, converter) applied to message text. First match wins.
@@ -92,10 +119,17 @@ _TRIO_RULES: list[tuple[str, re.Pattern, dict]] = [
     ("trio_bolus", re.compile(r"^Bolus of (?P<units>[\d.]+) U (?P<result>failed)"), {"units": float}),
     ("trio_bolus_cancel", re.compile(r"^Cancelling bolus$"), {}),
     ("glucose", re.compile(r"^Storing [1-9]\d* new glucose readings"), {}),
+    # the pump manager's didAdjustPumpClockBy; before 1.0.2 the raw TimeInterval
+    ("pump_clock_adjusted", re.compile(r"^(?:Pump clock adjusted by|didAdjustPumpClockBy) "
+                                       r"(?P<seconds>-?\d+(?:\.\d+)?)(?: s)?$"), {"seconds": float}),
 ]
 _TRIO_LOOP_FAILED = re.compile(r'Loop failed with error: (?P<error>.*?)"?\)?$')
 
 _TANDEM_RULES: list[tuple[str, re.Pattern, dict]] = [
+    # ahead of pump_response: older builds log a stream packet as a plain "Received message"
+    ("history_stream", re.compile(r"^Received (?:stream )?message: HistoryLogStreamResponse\("
+                                  r"cargo=(?P<boluses>[0-9a-fA-F]*), numberOfHistoryLogs=(?P<count>\d+)"),
+     {"boluses": bolus_records, "count": int}),
     ("pump_request", re.compile(r"^Writing message: (?P<name>\w+)\((?P<body>.*)\)\s*$"), {"body": fields}),
     ("pump_response", re.compile(r"^Received message: (?P<name>\w+)\((?P<body>.*)\)\s*$"), {"body": fields}),
     ("tb_set", re.compile(r"^Setting temp basal at (?P<rate>[\d.]+)U/hr for (?P<duration>[\d.]+)s"),
@@ -114,6 +148,16 @@ _TANDEM_RULES: list[tuple[str, re.Pattern, dict]] = [
     ("refused", re.compile(r"^Pump refused"), {}),
     ("suspended", re.compile(r"^Insulin Delivery Suspended!"), {}),
     ("resumed", re.compile(r"^Insulin Delivery Resumed!"), {}),
+    # HostDoseDates: a dose whose dates the host could not store, and the dates sent in their place.
+    # `raw` carries the pump serial (bytes 2-5), so it stays out of findings.
+    ("misdated_dose", re.compile(rf"^Misdated (?P<type>\w+) (?P<raw>[0-9a-f]*) ?(?P<problem>.*); "
+                                 rf"sent as (?P<sent_start>{_SWIFT_DATE}) to (?P<sent_end>{_SWIFT_DATE})$"),
+     {"problem": misdated_problems, "sent_start": swift_date, "sent_end": swift_date}),
+    ("history_bolus_report", re.compile(r"^Reporting (?P<count>\d+) bolus event\(s\) from pump history"),
+     {"count": int}),
+    ("history_backfill", re.compile(r"^Backfilling history (?P<first>\d+)-(?P<last>\d+) \((?P<count>\d+) entries\)"),
+     {"first": int, "last": int, "count": int}),
+    ("history_pruned", re.compile(r"^Pruned (?P<count>\d+) expired history logs"), {"count": int}),
 ]
 
 

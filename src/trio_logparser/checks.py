@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 
 from .dataset import Day
 from .events import PUMP_EPOCH, Event, response_name
+from .historylog import BOLEX_ACTIVATED, BOLUS_COMPLETED
 
 
 @dataclass
@@ -332,6 +333,137 @@ def bolus(d: Day) -> Iterator[Finding]:
                  **st, reason=reason, cancelled=cancelled)
 
 
+# --------------------------------------------------------------------------- dose dates
+
+MISDATED_HIGH = 3600  # s ahead of the phone: no nudge, but a stamp from another pump clock
+DAY_S = 86400
+
+# TandemKit's HistoryLogSyncIdentifier: version 1, a scheme byte, the pump serial, then the id named here.
+_SYNC_ID = {1: "bolusId", 2: "tempRateId", 3: "history record", 4: "extended bolusId", 5: "tempRateId"}
+
+
+def dose_label(raw: str) -> str:
+    """What a dose's ``raw`` names, without the pump serial its bytes 2-5 hold."""
+    if len(raw) == 20 and raw[:2] == "01" and (scheme := int(raw[2:4], 16)) in _SYNC_ID:
+        ident = int.from_bytes(bytes.fromhex(raw[12:]), "little")
+        if scheme == 5:
+            return f"{_SYNC_ID[scheme]} {ident & 0xFFFF} part {ident >> 16}"
+        return f"{_SYNC_ID[scheme]} {ident}"
+    return "no pump id"
+
+
+def _span(seconds: float) -> str:
+    s = abs(seconds)
+    if s >= 2 * DAY_S:
+        return f"{s / DAY_S:.0f} days"
+    if s >= 2 * 3600:
+        return f"{s / 3600:.0f} h"
+    return f"{s / 60:.0f} min" if s >= 120 else f"{s:.0f} s"
+
+
+@check("misdated_dose", "Doses TandemKit sent the host with dates other than the ones it worked out")
+def misdated_dose(d: Day) -> Iterator[Finding]:
+    """A mutable dose is re-sent with every replacing batch, so findings are one per dose."""
+    doses: dict[tuple, list[Event]] = {}
+    for e in d.tandem:
+        if e.kind == "misdated_dose":
+            doses.setdefault((e.data["type"], e.data["raw"]), []).append(e)
+    for (kind, raw), sends in doses.items():
+        e = sends[0]
+        problem = e.data["problem"]
+        what = f"{kind} ({dose_label(raw)})"
+        times = f" ({len(sends)} times)" if len(sends) > 1 else ""
+        info = {"type": kind, "dose": dose_label(raw), "sends": len(sends), **problem}
+        if (ahead := problem.get("start_ahead")) is not None:
+            # the host counts a bolus from its start, so one moved to now is insulin it thinks is fresh
+            sev = "high" if kind in ("bolus", "tempBasal") and ahead >= MISDATED_HIGH else "warn"
+            end = e.data["sent_end"]
+            runs_on = f", ending {end:%Y-%m-%d}" if (end - e.data["sent_start"]).total_seconds() > DAY_S else ""
+            yield _f("misdated_dose.start_ahead", sev, d, e,
+                     f"{what} was stamped {_span(ahead)} ahead of the phone's clock; TandemKit sent it "
+                     f"to the host as starting now{runs_on}{times}", **info)
+        elif (short := problem.get("ends_before_start")) is not None:
+            yield _f("misdated_dose.ends_before_start", "warn", d, e,
+                     f"{what} ended {_span(short)} before it started; TandemKit sent it with no length{times}",
+                     **info)
+        elif "negative_delivery" in problem:
+            yield _f("misdated_dose.negative_delivery", "warn", d, e,
+                     f"{what} had {problem['negative_delivery']:g} U delivered; TandemKit sent it as 0 U{times}",
+                     **info)
+        else:  # wording this build of the parser does not know
+            yield _f("misdated_dose.other", "warn", d, e,
+                     f"{what} had dates TandemKit replaced before sending it{times}", **info)
+
+
+# --------------------------------------------------------------------------- pump history
+
+HISTORY_REPORT_WINDOW = 120  # s a backfill tick's reads precede its bolus report by
+# TandemKit reports no history bolus older than 24 h; 12 h more for a pump clock in another zone.
+STALE_HISTORY = timedelta(hours=36)
+BOLUS_RECORD = {BOLUS_COMPLETED: "bolusId", BOLEX_ACTIVATED: "extended bolusId"}
+
+
+@check("history_bolus", "History bolus reports right after reading bolus records stamped far from the phone's clock")
+def history_bolus(d: Day) -> Iterator[Finding]:
+    """The log does not say which boluses a pass reported, only how many; the records it had just
+    read say what it had to report from."""
+    streams = Index([e for e in d.tandem if e.kind == "history_stream" and e.data["boluses"]])
+    for e in d.tandem:
+        if e.kind != "history_bolus_report":
+            continue
+        stale: dict[tuple, tuple[dict, float]] = {}
+        for s in streams.window(e.ts, HISTORY_REPORT_WINDOW, 0):
+            for b in s.data["boluses"]:
+                off = PUMP_EPOCH + timedelta(seconds=b["pump_secs"]) - s.ts
+                if abs(off) > STALE_HISTORY:
+                    stale[(b["type"], b["bolus_id"])] = (b, off.total_seconds())
+        if not stale:
+            continue
+        listed = [f"{BOLUS_RECORD[b['type']]} {b['bolus_id']}" + (f" {b['units']:g} U" if b["units"] is not None else "")
+                  for b, _ in list(stale.values())[:4]]
+        count = e.data["count"]
+        yield _f("history_bolus.stale", "high", d, e,
+                 f"TandemKit reported {count} bolus{'es' if count != 1 else ''} from pump history right after "
+                 f"reading {len(stale)} bolus record{'s' if len(stale) != 1 else ''} stamped "
+                 f"{_span(min(abs(o) for _, o in stale.values()))} or more from the phone's clock: "
+                 f"{', '.join(listed)}{', …' if len(stale) > len(listed) else ''}",
+                 reported=count,
+                 stale=[{"record": BOLUS_RECORD[b["type"]], "bolus_id": b["bolus_id"], "units": b["units"],
+                         "off_s": off} for b, off in stale.values()])
+
+
+RATCHET_FOLLOWS = 15  # s from a prune to the deeper slice it lets the walk take
+RATCHET_STEPS = 3
+DEEP_SLICE = 200  # entries; an incremental read is a handful, a slice of the walk backward 255
+
+
+@check("history_backfill", "History walk reading deeper each time the store prunes the record it stopped at")
+def history_backfill(d: Day) -> Iterator[Finding]:
+    """TandemKit's walk backward stops at the first record older than its target. The session store
+    prunes records stamped over 90 days before the phone's clock; when that takes the record the walk
+    stopped at, the next tick reads a slice deeper, which the next prune removes in turn.
+    """
+    top: int | None = None  # highest sequence number read so far today
+    pruned: Event | None = None
+    steps: list[Event] = []
+    for e in d.tandem:
+        if e.kind == "history_pruned":
+            pruned = e
+        elif e.kind == "history_backfill":
+            deeper = e.data["last"] < top if top is not None else e.data["count"] >= DEEP_SLICE
+            if pruned and deeper and (e.ts - pruned.ts).total_seconds() <= RATCHET_FOLLOWS:
+                steps.append(e)
+            pruned = None
+            top = max(top or 0, e.data["last"])
+    if len(steps) >= RATCHET_STEPS:
+        yield _f("history_backfill.prune_ratchet", "warn", d, steps[0],
+                 f"history walk read {len(steps)} slices deeper {steps[0].ts:%H:%M}–{steps[-1].ts:%H:%M}, each "
+                 f"right after the store pruned the records it had stopped at (down to sequence "
+                 f"{min(s.data['first'] for s in steps)}): the pump's records there are stamped over 90 days "
+                 "before the phone's clock",
+                 steps=len(steps), lowest=min(s.data["first"] for s in steps))
+
+
 # --------------------------------------------------------------------------- requests
 
 RESPONSE_TIMEOUT = 30  # TandemKit's own write timeout
@@ -433,6 +565,14 @@ def pump_clock(d: Day) -> Iterator[Finding]:
                 flagged = False
         elif e.kind == "pump_request" and e.data.get("name") == "ChangeTimeDateRequest":
             yield _f("pump_clock.set_time", "info", d, e, "TandemKit set the pump's time/date")
+    # Trio's side of a clock write: setup's happens before Trio records the pump's log lines
+    for e in d.trio:
+        if e.kind == "pump_clock_adjusted" and abs(moved := e.data["seconds"]) > CLOCK_DRIFT_S:
+            big = abs(moved) > DAY_S
+            yield _f("pump_clock.adjusted", "high" if big else "warn", d, e,
+                     f"TandemKit moved the pump's clock by {moved / DAY_S:+.2f} days; its history from before "
+                     "then carries the old clock's stamps" if big else
+                     f"TandemKit moved the pump's clock by {moved:+.0f}s", moved_s=moved)
 
 
 # --------------------------------------------------------------------------- log health

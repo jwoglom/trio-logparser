@@ -95,7 +95,9 @@ analyzed and `scan` says so. Builds come from each `Trio started` line and, for 
 with no launch in them, from the saved export header's `== App ==` section.
 
 Testers are shown as initials by default (`--names` for full names). `show` masks pump serials,
-transmitter IDs and emails; still treat its output as health data.
+transmitter IDs and emails; still treat its output as health data. A TandemKit dose's `raw`
+(`0101…`–`0105…`, 20 hex digits) holds the pump serial in bytes 2–5, which Trio's export leaves in:
+`show` masks it and findings name the dose by its pump id (`bolusId 123`) instead.
 
 ### How it works
 
@@ -120,7 +122,19 @@ Checks:
   `timeout`, `disconnect`, `torn_line`.
 - `loop_gap` — > 15 min without a successful loop, annotated with failures, missing glucose,
   pump disconnects, and silent-log stretches.
-- `reconnect_storm`, `pump_clock.*`, `torn_lines`, `log_line_lost`, `app_restart`.
+- `misdated_dose.*` — TandemKit's `Misdated …` errors: a dose whose dates it replaced before sending
+  it to the host, one finding per dose however often it was re-sent. `start_ahead` (`high` for a bolus
+  or temp basal stamped an hour or more ahead of the phone: the host was told it starts now),
+  `ends_before_start`, `negative_delivery`.
+- `history_bolus.stale` — "Reporting N bolus event(s) from pump history" right after the pass read
+  bolus records the pump stamped more than 36 h from the phone's clock (`BolusCompleted` and
+  `BolexActivated` are decoded from the logged stream packets, so no Swift toolchain is needed).
+- `history_backfill.prune_ratchet` — the walk backward reading a slice deeper each time the session
+  store prunes the records it had stopped at.
+- `pump_clock.*` — `drift` (pump vs phone at each `TimeSinceResetResponse`), `set_time`, and
+  `adjusted`: Trio's own line for a clock write, the only trace of setup's, which happens before Trio
+  records the pump's log lines (`high` past a day: history from before it carries the old clock's stamps).
+- `reconnect_storm`, `torn_lines`, `log_line_lost`, `app_restart`.
 
 Adding a known issue: append to `known_issues.json` (`fix_sha`, `log_signature`,
 `signature_kind`, optional `fixed_marker_regex`, `checks`, `strength`, `streak`) and check
