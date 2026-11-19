@@ -4,20 +4,28 @@ from __future__ import annotations
 
 import argparse
 import collections
+import shlex
 import sys
+from pathlib import Path
 
 from . import analysis, checks, known
 from .builds import Repo, build_at
-from .dataset import alias, discover
+from .dataset import alias, discover, from_export
 from .normalize import mask
+from .parse import EXPORT_MAGIC, is_export
 
 SEV_ORDER = {"high": 0, "warn": 1, "info": 2}
 RECENT_DAYS = 7  # builds committed within this many days of the newest one count as "recent"
 
 
+EXPORT_PERSON = "export"
+
+
 def _common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--dest", help="organized log root (default: $TRIO_LOGS_DIR)")
-    p.add_argument("--person", action="append", help="limit to a person (name or alias); repeatable")
+    p.add_argument("--file", help="analyze one 'Trio Logs' export file instead of the organized tree")
+    p.add_argument("--person", action="append",
+                   help="limit to a person (name or alias); repeatable. With --file: label for its person")
     p.add_argument("--since", help="first day, YYYY-MM-DD")
     p.add_argument("--until", help="last day, YYYY-MM-DD")
     p.add_argument("--tandemkit-repo", help="TandemKit checkout (default: $TANDEMKIT_REPO)")
@@ -31,7 +39,15 @@ class Ctx:
         from .cli import logs_root
 
         self.args = args
-        self.res = analysis.run(logs_root(args), args.person, args.since, args.until, only)
+        if args.file:
+            path = Path(args.file).expanduser()
+            if not is_export(path):
+                sys.exit(f"error: {path} is not a 'Trio Logs' export (first line must be '{EXPORT_MAGIC}')")
+            person = args.person[0] if args.person else EXPORT_PERSON
+            self.res = analysis.run(None, since=args.since, until=args.until, only=only,
+                                    loaded=from_export(path, person))
+        else:
+            self.res = analysis.run(logs_root(args), args.person, args.since, args.until, only)
         self.repo = Repo(args.tandemkit_repo)
         tks = {b.tandemkit for d in self.res.days for _, b in d.builds if b.tandemkit}
         self.newest = max(tks, key=self.repo.time, default=None)
@@ -119,7 +135,9 @@ def cmd_findings(args) -> int:
         if args.refs:
             d = c.res.day(f.person, f.day)
             path = d.path(f.src) if d else None
-            if path:
+            if path and c.args.file:
+                print(f"     trio-logs show --file {shlex.quote(c.args.file)} {f.lineno}")
+            elif path:
                 print(f"     trio-logs show {c.who(f.person)} {f.day} {f.src} {f.lineno}")
     if len(shown) < len(fs):
         print(f"... {len(fs) - len(shown)} more (--all or --limit)")
@@ -198,11 +216,21 @@ def cmd_builds(args) -> int:
 def cmd_show(args) -> int:
     from .cli import logs_root
 
-    root = logs_root(args)
-    day = next((d for d in discover(root, [args.person_]) if d.day == args.day), None)
-    path = day and day.path(args.src)
-    if not path:
-        sys.exit(f"no {args.src} log for {args.person_} on {args.day}")
+    if args.file:
+        if len(args.ref) != 1:
+            sys.exit("with --file, give only the line number")
+        path, line = Path(args.file).expanduser(), int(args.ref[0])
+    else:
+        if len(args.ref) != 4:
+            sys.exit("usage: trio-logs show <person> <day> <trio|tandem> <line>  (or --file <export> <line>)")
+        person, day_, src, line = args.ref[0], args.ref[1], args.ref[2], int(args.ref[3])
+        if src not in ("trio", "tandem"):
+            sys.exit("src must be trio or tandem")
+        day = next((d for d in discover(logs_root(args), [person]) if d.day == day_), None)
+        path = day and day.path(src)
+        if not path:
+            sys.exit(f"no {src} log for {person} on {day_}")
+    args.line = line
     lo, hi = args.line - args.context, args.line + args.context
     with open(path, encoding="utf-8", errors="replace") as fh:
         for i, line in enumerate(fh, 1):
@@ -252,11 +280,10 @@ def add_commands(sub) -> None:
     p.set_defaults(func=cmd_builds)
 
     p = sub.add_parser("show", help="print masked log lines around a finding")
-    p.add_argument("person_", metavar="person")
-    p.add_argument("day")
-    p.add_argument("src", choices=["trio", "tandem"])
-    p.add_argument("line", type=int)
+    p.add_argument("ref", nargs="+", metavar="REF",
+                   help="<person> <day> <trio|tandem> <line>, or just <line> with --file")
     p.add_argument("-C", "--context", type=int, default=8)
     p.add_argument("--width", type=int, default=240)
     p.add_argument("--dest")
+    p.add_argument("--file", help="a 'Trio Logs' export file (findings run with --file point into it)")
     p.set_defaults(func=cmd_show)

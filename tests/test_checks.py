@@ -260,3 +260,72 @@ def test_streak_episodes():
     hits += [H(what="signature", ts=t0 + timedelta(minutes=5)), H(what="marker", ts=t0 + timedelta(minutes=6)),
              H(what="signature", ts=t0 + timedelta(minutes=7))]
     assert [len(ep) for ep in known.episodes(issue, hits)] == [4]
+
+
+# --------------------------------------------------------------------------- "Trio Logs" export
+
+def export(lines: list[str]) -> str:
+    """A made-up Trio 1.0.2 log export: header sections, then the merged log."""
+    return "Trio Logs\nCreated: 2026-09-21 00:00:00 -0400\n\n== App ==\nTrio: 1.0.2 (1)\n\n== Log ==\n" + "".join(lines)
+
+
+def xtrio(t: str, msg: str, cat: str = "Loop", level: str = "") -> str:
+    return f"{DAY} {t}.000 -0400 Trio {level + ': ' if level else ''}[{cat}] {msg}\n"
+
+
+def xpump(t: str, msg: str, level: str = "INFO") -> str:
+    return f"{DAY} {t}.000 -0400 Pump [delegate] [{level}] TandemPumpManager.swift - fn()#1: {msg}\n"
+
+
+def test_export_parses_sources_levels_and_continuations(tmp_path):
+    from trio_logparser.dataset import from_export
+    from trio_logparser.parse import is_export, parse_export
+
+    p = tmp_path / "Trio Logs.txt"
+    p.write_text(export([
+        xtrio("10:00:00", "Trio started: v1.0.2.9 (1) feat/x abc1234; LoopKit 1111111, TandemKit def5678", "Lifecycle"),
+        xtrio("10:00:01", "Loop failed: deviceState(x)", level="WARNING"),
+        "    continued\n",
+        xpump("10:00:02", "Writing message: SetTempRateRequest(cargo=00, minutes=30, percent=50)"),
+        f"{DAY} 10:00:03.000 -0400 CGM [connection] Scanning for sensor\n",
+        f"{DAY} 10:00:04.000 -0400 Algorithm enacted · BG 100\n",
+    ]))
+    assert is_export(p)
+    recs = list(parse_export(p))
+    assert [(r.src, r.level) for r in recs] == [("trio", "INFO"), ("trio", "WARNING"), ("tandem", "INFO"),
+                                                ("trio", "INFO"), ("trio", "INFO")]
+    assert recs[1].extra == ["continued"] and recs[2].lineno == 11
+    (d,) = from_export(p, "Pat Doe")
+    start = next(e for e in d.trio if e.kind == "app_start")
+    assert (start.data["branch"], start.data["commit"], start.data["tandemkit"]) == ("feat/x", "abc1234", "def5678")
+    assert [e.kind for e in d.trio if e.kind in ("loop_failed", "problem")] == ["loop_failed", "problem"]
+    assert d.tandem[0].data["name"] == "SetTempRateRequest"
+
+
+def test_export_temp_basal_and_bolus_outcomes(tmp_path):
+    from trio_logparser.dataset import from_export
+
+    p = tmp_path / "Trio Logs.txt"
+    p.write_text(export([
+        xpump("10:00:00", "Setting temp basal at 0.8U/hr for 1800.0s"),
+        xpump("10:00:01", "Temp basal enacted!"),
+        xtrio("10:00:01", "Temp basal enacted: 0.85 U/h for 30 min"),
+        xpump("10:00:02", "Enacting bolus - units 0.3U"),
+        xtrio("10:00:05", "SMB enacted: 0.3 U"),
+        xpump("10:05:00", "Setting temp basal at 1.0U/hr for 1800.0s"),
+        xpump("10:05:00", "Temp basal enacted!"),
+        xtrio("10:05:00", "Temp basal command failed: 1.0 U/h for 30 min", "Pump"),
+        xtrio("10:06:00", "Enacting bolus 2.0 U, manual", "Bolus"),
+        xpump("10:06:00", "Enacting bolus - units 2.0U"),
+        xtrio("10:06:02", "Bolus enacted: 2.0 U, manual", "Bolus"),
+        xtrio("10:07:00", "Loop finished in 1.2 s"),
+    ]))
+    (d,) = from_export(p, "Pat Doe")
+    tb = [e.data for e in d.trio if e.kind == "trio_temp_basal"]
+    assert [(t["result"], t["rate"], t["duration_min"]) for t in tb] == [("succeeded", 0.85, 30), ("failed", 1.0, 30)]
+    assert [(e.data["units"], e.data.get("manual")) for e in d.trio if e.kind == "trio_bolus"] == [(0.3, None), (2.0, True)]
+    found = kinds(run("temp_basal", d))
+    assert "temp_basal.rate_mismatch" in found or "temp_basal.rate_rounded_down" in found
+    assert "temp_basal.failed_but_enacted" in found
+    assert kinds(run("bolus", d)) == []
+    assert [e.kind for e in d.trio if e.kind == "loop_success"] == ["loop_success"]

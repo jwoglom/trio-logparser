@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import events as ev
-from .parse import parse
+from .parse import parse, parse_export
 
 _DAY_FILE = re.compile(r"^(?P<day>\d{4}-\d{2}-\d{2})_(?P<kind>tandem_log|log)\.txt$")
 
@@ -77,6 +77,25 @@ def discover(root: Path, people: list[str] | None = None) -> list[Day]:
                     d.trio_path = f
                 else:
                     d.tandem_path = f
+    return [days[k] for k in sorted(days)]
+
+
+def from_export(path: Path, person: str) -> list[Day]:
+    """Days of one "Trio Logs" export file, split by local date; both logs point at the file."""
+    path = Path(path)
+    days: dict[str, Day] = {}
+    records: dict[tuple[str, str], list] = {}
+    for r in parse_export(path):
+        key = r.ts.date().isoformat()
+        d = days.get(key) or days.setdefault(key, Day(person, key))
+        if r.src == "trio":
+            d.trio_path = path
+        else:
+            d.tandem_path = path
+        getattr(d, f"{r.src}_minutes").add(minute(r.ts))
+        records.setdefault((key, r.src), []).append(r)
+    for (key, src), rs in records.items():
+        setattr(days[key], src, list(ev.extract(rs)))
     return [days[k] for k in sorted(days)]
 
 

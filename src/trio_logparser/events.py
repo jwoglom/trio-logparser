@@ -66,6 +66,32 @@ _TRIO_RULES: list[tuple[str, re.Pattern, dict]] = [
     ("trio_bolus_cancel", re.compile(r"^(?:Cancel bolus|Bolus cancelled|Cancel Bolus failed|Bolus cancellation failed)"), {}),
     ("glucose", re.compile(r"^New glucose found"), {}),
     ("pump_status_basal", re.compile(r"^New pump status Basal: .*BasalDeliveryState\.(?P<state>\w+)"), {}),
+    # Trio 1.0.2+ wording (the "Trio Logs" export; APSManager.swift on Trio dev)
+    ("app_start", re.compile(r"^Trio started: v(?P<version>\S+) \(\d+\) (?P<branch>\S+) (?P<commit>[0-9a-f]+)"
+                             r"(?:;.*?\bTandemKit (?P<tandemkit>[0-9a-f]+))?"), {}),
+    ("loop_start", re.compile(r"^Loop started, mode \w+"), {}),
+    ("loop_success", re.compile(r"^Loop finished in [\d.]+ s$"), {}),
+    ("loop_failed", re.compile(r"^Loop failed: (?P<error>.*)"), {}),
+    ("enacted", re.compile(r"^Determination marked as (?P<ok>enacted|not enacted)$"),
+     {"ok": lambda v: v == "enacted"}),
+    # "Temp basal command failed" is logged by the PumpManager wrapper, "enacted" after it returns
+    ("trio_temp_basal", re.compile(r"^Temp basal (?P<result>enacted|command failed): (?P<rate>[\d.]+) U/h "
+                                   r"for (?P<duration_min>\d+) min"),
+     {"result": lambda v: "succeeded" if v == "enacted" else "failed", "rate": float,
+      "duration_min": int}),
+    ("rate_not_on_table", re.compile(r"^Temp basal (?P<rate>[\d.]+) U/h is not on the pump's rate table"),
+     {"rate": float}),
+    ("trio_bolus_request", re.compile(r"^Enacting bolus (?P<units>[\d.]+) U, (?P<manual>manual|automatic)$"),
+     {"units": float, "manual": lambda v: v == "manual"}),
+    ("trio_bolus", re.compile(r"^Bolus (?P<result>enacted): (?P<units>[\d.]+) U, (?P<manual>manual|automatic)$"),
+     {"result": lambda v: "succeeded", "units": float, "manual": lambda v: v == "manual"}),
+    # SMBs go straight to the pump manager: no "Enacting"/"Bolus enacted" line, and a failure
+    # surfaces only as "Loop failed: ..."
+    ("trio_bolus", re.compile(r"^SMB (?P<result>enacted): (?P<units>[\d.]+) U$"),
+     {"result": lambda v: "succeeded", "units": float}),
+    ("trio_bolus", re.compile(r"^Bolus of (?P<units>[\d.]+) U (?P<result>failed)"), {"units": float}),
+    ("trio_bolus_cancel", re.compile(r"^Cancelling bolus$"), {}),
+    ("glucose", re.compile(r"^Storing [1-9]\d* new glucose readings"), {}),
 ]
 _TRIO_LOOP_FAILED = re.compile(r'Loop failed with error: (?P<error>.*?)"?\)?$')
 
@@ -104,6 +130,9 @@ def _convert(m: re.Match, conv: dict) -> dict:
     return d
 
 
+PROBLEM_LEVELS = ("WARN", "WARNING", "ERROR", "FAULT")
+
+
 def extract(records: Iterable[Record]) -> Iterator[Event]:
     for r in records:
         if r.level == TORN:
@@ -121,7 +150,7 @@ def extract(records: Iterable[Record]) -> Iterator[Event]:
             if r.src == "trio" and "Loop failed with error" in msg and "finalizeLoop" in r.func:
                 m = _TRIO_LOOP_FAILED.search(msg)
                 yield Event("loop_failed", r.ts, r.src, r.lineno, {"error": m["error"] if m else msg})
-        if r.level in ("WARN", "WARNING", "ERROR"):
+        if r.level in PROBLEM_LEVELS:
             yield Event("problem", r.ts, r.src, r.lineno,
                         {"level": r.level, "file": r.file, "func": r.func, "msg": r.msg[:400]})
 

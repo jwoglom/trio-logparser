@@ -49,11 +49,18 @@ def build_of(d: Day, ts) -> bld.Build | None:
     return bld.build_at(d, ts)
 
 
-def run(root: Path, people: list[str] | None = None, since: str | None = None,
-        until: str | None = None, only: list[str] | None = None) -> Result:
-    days = [d for d in discover(root, people)
-            if (not since or d.day >= since) and (not until or d.day <= until)]
-    days = sorted(load_all(days), key=lambda d: (d.person, d.day))
+def run(root: Path | None, people: list[str] | None = None, since: str | None = None,
+        until: str | None = None, only: list[str] | None = None,
+        loaded: list[Day] | None = None) -> Result:
+    """Analyze the organized tree at ``root``, or already-loaded days (``loaded``, e.g. an export)."""
+    def in_range(d: Day) -> bool:
+        return (not since or d.day >= since) and (not until or d.day <= until)
+
+    if loaded is not None:
+        days = sorted((d for d in loaded if in_range(d)), key=lambda d: (d.person, d.day))
+    else:
+        days = sorted(load_all([d for d in discover(root, people) if in_range(d)]),
+                      key=lambda d: (d.person, d.day))
     bld.assign(days)
 
     findings: list[checks.Finding] = []

@@ -110,5 +110,64 @@ def parse_tandem(path: Path) -> Iterator[Record]:
         prev = rec
 
 
+# Trio's "Trio Logs" export (Trio 1.0.2+, Settings ▸ Share logs): a header (== App ==, == Pump ==,
+# ...), then ``== Log ==`` and every source merged in time order, continuation lines indented 4::
+#
+#     2026-11-17 15:10:31.486 -0500 Trio [Lifecycle] Trio started: v1.0.2.76 (1) ...
+#     2026-11-17 15:47:09.671 -0500 Trio WARNING: [Loop] Loop failed: ...
+#     2026-11-17 15:53:38.007 -0500 Pump [delegate] [INFO] TandemPeripheralManager.swift - f()#476: msg
+#     2026-11-17 15:44:17.481 -0500 CGM [connection] Scanning for sensor
+#     2026-11-17 15:47:09.685 -0500 Algorithm suggested · BG 149 · ...
+#
+# Pump lines come from Trio's device-log store, not TandemLogger's file, so they are never torn.
+EXPORT_MAGIC = "Trio Logs"
+EXPORT_LOG_HEADER = "== Log =="
+_EXPORT = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?) (?P<tz>[+-]\d{4}) (?P<source>\S+) (?P<rest>.*)$"
+)
+_EXPORT_APP = re.compile(r"^(?:(?P<level>[A-Z]+): )?\[(?P<cat>[^\]]*)\] (?P<msg>.*)$")
+_EXPORT_DEVICE = re.compile(r"^\[(?P<cat>[^\]]*)\] (?P<msg>.*)$")
+_EXPORT_TANDEM = re.compile(r"^\[(?P<level>[A-Z]+)\] (?P<file>\S+) - (?P<func>.*?)#(?P<line>\d+): (?P<msg>.*)$")
+
+
+def is_export(path: Path) -> bool:
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.readline().rstrip("\r\n") == EXPORT_MAGIC
+
+
+def parse_export(path: Path) -> Iterator[Record]:
+    """Records of a Trio log export: Trio/Watch/CGM/Algorithm lines as ``trio``, Pump as ``tandem``."""
+    cur: Record | None = None
+    in_log = False
+    for i, line in _iter_lines(path):
+        if not in_log:
+            in_log = line == EXPORT_LOG_HEADER
+            continue
+        m = _EXPORT.match(line) if line[:1] == "2" else None
+        if not m:
+            if cur is not None:
+                cur.extra.append(line.removeprefix("    "))
+            continue
+        if cur is not None:
+            yield cur
+        ts, tz, source, rest = datetime.fromisoformat(m["ts"]), m["tz"], m["source"], m["rest"]
+        if source == "Pump":
+            dm = _EXPORT_DEVICE.match(rest)
+            body = dm["msg"] if dm else rest
+            if tm := _EXPORT_TANDEM.match(body):
+                cur = Record("tandem", ts, tz, tm["level"], dm["cat"], tm["file"], tm["func"], tm["msg"], i)
+            else:  # another pump driver's free-form line
+                cur = Record("tandem", ts, tz, "INFO", dm["cat"] if dm else "", "", "", body, i)
+        elif source in ("Trio", "Watch") and (am := _EXPORT_APP.match(rest)):
+            level = am["level"] or ("WATCH" if source == "Watch" else "INFO")
+            cur = Record("trio", ts, tz, level, am["cat"], "", "", am["msg"], i)
+        else:  # CGM / Algorithm / other device sources: kept as trio-side context
+            dm = _EXPORT_DEVICE.match(rest)
+            cur = Record("trio", ts, tz, "INFO", source if not dm else f"{source}/{dm['cat']}", "", "",
+                         dm["msg"] if dm else rest, i)
+    if cur is not None:
+        yield cur
+
+
 def parse(path: Path) -> Iterator[Record]:
     return parse_tandem(path) if Path(path).name.endswith("_tandem_log.txt") else parse_trio(path)

@@ -55,6 +55,21 @@ uv run trio-logs builds                     # which build each tester ran when
 uv run trio-logs show J.D. 2026-09-20 tandem 1234 -C 10   # masked context around a finding
 ```
 
+A single **"Trio Logs" export** (Trio 1.0.2+: one file with `== App ==` … `== Log ==` sections,
+every source merged in time order) is analyzed directly with `--file`; findings' line numbers
+point into that file:
+
+```sh
+uv run trio-logs scan --file "Trio Logs 2026-11-18 1301.txt"
+uv run trio-logs findings --file "Trio Logs 2026-11-18 1301.txt" --refs
+uv run trio-logs show --file "Trio Logs 2026-11-18 1301.txt" 10509 -C 10
+```
+
+`Pump` lines carry TandemKit's own text (`[INFO] File.swift - func#line: msg`) and are the
+`tandem` side; `Trio`/`Watch`/`CGM`/`Algorithm` lines are the `trio` side. Trio 1.0.2 reworded its
+loop/dose messages (`Loop finished in`, `Temp basal enacted: … U/h`, `SMB enacted:`), mapped in
+`events.py`. `organize` and `history-jsonl` don't read exports yet.
+
 Testers are shown as initials by default (`--names` for full names). `show` masks pump serials,
 transmitter IDs and emails; still treat its output as health data.
 
