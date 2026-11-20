@@ -11,6 +11,7 @@ from pathlib import Path
 
 from trio_logparser import viewer, web
 from trio_logparser.dataset import discover
+from trio_logparser.parse import Record
 
 DAY = "2026-09-20"
 
@@ -142,6 +143,50 @@ def stream_line(t: str, *records: bytes) -> str:
     cargo = (bytes([len(records), 7]) + b"".join(records) + b"\xab\xcd").hex()
     return xpump(t, f"Received stream message: HistoryLogStreamResponse(cargo={cargo}, "
                     f"numberOfHistoryLogs={len(records)}, streamId=7, historyLogStreamBytes=[], historyLogs=[])")
+
+
+def test_pump_lines_are_filed_by_topic():
+    def rec(file: str, func: str, msg: str) -> Record:
+        return Record("tandem", datetime(2026, 9, 20), "-0400", "INFO", "delegate", file, func, msg, 1, source="Pump")
+
+    peripheral = "TandemPeripheralManager.swift"
+    cases = [
+        (rec(peripheral, "sendUntyped(_:)", "Writing message: SetTempRateRequest(cargo=00, minutes=30)"), "Delivery"),
+        (rec(peripheral, "sendUntyped(_:)", "Received message: ControlIQIOBResponse(cargo=00, iobType=0)"),
+         "Status reads"),
+        (rec(peripheral, "sendUntyped(_:)", "Writing message: HistoryLogRequest(cargo=00)"), "History"),
+        (rec(peripheral, "sendUntyped(_:)", "Writing message: DismissNotificationRequest(cargo=00)"), "Alerts"),
+        (rec(peripheral, "sendUntyped(_:)", "Writing message: Jpake1aRequest(cargo=00)"), "Connection"),
+        (rec(peripheral, "handleHistoryLogStreamPacket(_:)", "Received stream message: HistoryLogStreamResponse("
+             "cargo=00, numberOfHistoryLogs=0)"), "History"),
+        (rec("TandemPumpManager.swift", "enactTempBasal(unitsPerHour:for:)", "Temp basal enacted!"), "Delivery"),
+        (rec("TandemPumpManager.swift", "recordSiteChange(at:)", "Recording site change"), "Cartridge & site"),
+        (rec("TandemBluetoothManager.swift", "startScan()", "Started scanning"), "Connection"),
+        (rec("TandemPumpManager+BasalReconciliation.swift", "reconcileBasalHistory()", "Basal difference"), "Delivery"),
+        (rec("TandemPumpManager+Widgets.swift", "update()", "Updated"), "Widgets"),
+        (rec("", "", "another driver's free-form line"), "delegate"),
+    ]
+    assert [viewer.pump_topic(r) for r, _ in cases] == [want for _, want in cases]
+
+
+def test_cargo_shows_except_where_it_carries_a_serial():
+    from trio_logparser.normalize import mask
+
+    line = "Received message: HighestAamResponse(cargo=0a1b2c3d4e5f60718293a4b5c6, aamId=3)"
+    assert mask(line) == line
+    masked = mask("Received message: PumpVersionBResponse(cargo=0a0b0c0d0e0f10111213, serialNumber=12345678, "
+                  "pcbSerialNumberA=87654321, modelNumber=1)")
+    assert "0a0b0c0d" not in masked and "12345678" not in masked and "87654321" not in masked
+    assert "modelNumber=1" in masked
+
+
+def test_findings_carry_their_kind_and_the_severity_scale(tmp_path):
+    p = export_file(tmp_path, [xtrio("01:00:00", "Loop succeeded"), xtrio("01:40:00", "Loop succeeded")])
+    b = viewer.bundle(viewer.from_file(p))
+    [gap] = [f for f in b["findings"] if f["check"] == "loop_gap"]
+    kind = b["finding_kinds"]["loop_gap"]
+    assert kind["title"] and kind["what"] and kind["why"][gap["severity"]]
+    assert set(b["severity_scale"]) == {"high", "warn", "info"}
 
 
 def test_history_without_the_decoder_lists_record_headers(tmp_path):

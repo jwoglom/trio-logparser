@@ -82,6 +82,9 @@ function srcBadge(name) {
 const sevBadge = (sev) => h("span", { class: `sev ${sev}` }, sev);
 
 const LEVEL_RANK = { WARN: 1, WARNING: 1, TORN: 1, ORPHAN: 1, ERROR: 2, FAULT: 2 };
+const LEVEL_NOTE = "Pump lines carry TandemKit's own level. Trio's export prints a level only on its warnings and " +
+  "errors, so Trio's other lines, and CGM and oref lines, show as INFO.";
+const levelBadge = (l) => { const r = LEVEL_RANK[l] || 0; return h("span", { class: r > 1 ? "lvl-err" : r ? "lvl-warn" : "lvl-info" }, l); };
 const isBad = (s) => /fail|timeout|timed out|blocked|refused|misdated|no outcome|cancelled before|disconnect|not on the pump/i.test(s || "");
 
 // ------------------------------------------------------------------ state
@@ -98,8 +101,9 @@ const S = {
   history: null,
   lower: null, // lowercased log text, built on first search
   sel: {}, // tab id -> selected row
+  colW: {}, // tab id -> {column label: px} for columns the viewer resized
   f: {
-    log: { q: "", src: null, level: 0, cat: -1 },
+    log: { q: "", src: null, level: 0, cat: null }, // cat: [source index, category index]
     doses: { q: "", who: new Set(["Trio", "Driver", "Pump"]) },
     cgm: { q: "" },
     oref: { q: "", kind: "all" },
@@ -155,11 +159,26 @@ class VTable {
     this.rows = [];
     this.cols = [];
     this.selIndex = -1;
+    this.key = null;
     this.onSelect = null;
     this.onTop = null;
     this.rowClass = null;
     this.raf = 0;
     this.body.addEventListener("scroll", () => { this.head.scrollLeft = this.body.scrollLeft; this.schedule(); });
+    // drag a header grip to resize that column; double-click it to go back to the default width
+    this.headRow.addEventListener("pointerdown", (e) => {
+      const grip = e.target.closest(".col-grip");
+      if (!grip || e.button !== 0) return;
+      const c = this.cols[+grip.dataset.col], w0 = grip.parentElement.getBoundingClientRect().width;
+      dragWith(grip, e, (dx) => { setColWidth(this.key, c.label, w0 + dx); this.layout(); }, saveColWidths);
+    });
+    this.headRow.addEventListener("dblclick", (e) => {
+      const grip = e.target.closest(".col-grip");
+      if (!grip) return;
+      setColWidth(this.key, this.cols[+grip.dataset.col].label, null);
+      saveColWidths();
+      this.layout();
+    });
     new ResizeObserver(() => this.schedule()).observe(this.body);
     this.body.addEventListener("click", (e) => {
       const r = e.target.closest(".vt-row");
@@ -178,18 +197,28 @@ class VTable {
     });
   }
 
-  set(cols, rows, selected, empty) {
+  set(cols, rows, selected, empty, key = null) {
     this.cols = cols;
     this.rows = rows;
     this.empty = empty;
-    this.root.style.setProperty("--cols", cols.map((c) => c.w).join(" "));
-    // narrowest the columns may get before the table scrolls sideways
-    const minW = cols.reduce((sum, c) => sum + (+(/(\d+(?:\.\d+)?)px/.exec(c.w) || [0, 160])[1]), 0) + 10 * (cols.length - 1) + 20;
-    this.root.style.setProperty("--minw", `${minW}px`);
-    this.headRow.replaceChildren(...cols.map((c) => h("div", { class: `vt-cell ${c.num ? "num" : ""}`, title: c.title || null }, c.label)));
+    this.key = key;
+    this.layout();
+    this.headRow.replaceChildren(...cols.map((c, i) => h("div", { class: `vt-cell ${c.num ? "num" : ""}`, title: c.title || null },
+      h("span", { class: "vt-label" }, c.label),
+      h("span", { class: "col-grip", "data-col": i, title: "Drag to resize this column; double-click to reset it" }))));
     this.spacer.style.height = `${rows.length * this.rh}px`;
     this.selIndex = selected == null ? -1 : rows.indexOf(selected);
     this.render();
+  }
+
+  // column widths: the tab's defaults, with any the viewer dragged
+  layout() {
+    const saved = S.colW[this.key] || {};
+    const ws = this.cols.map((c) => (saved[c.label] ? `${saved[c.label]}px` : c.w));
+    this.root.style.setProperty("--cols", ws.join(" "));
+    // narrowest the columns may get before the table scrolls sideways
+    const minW = ws.reduce((sum, w) => sum + (+(/(\d+(?:\.\d+)?)px/.exec(w) || [0, 160])[1]), 0) + 10 * (ws.length - 1) + 20;
+    this.root.style.setProperty("--minw", `${minW}px`);
   }
 
   schedule() {
@@ -288,7 +317,7 @@ const TABS = [
     cols: () => [
       { label: "time", w: "96px", cls: "mono", get: (i) => fmtClock(S.D.lines.t[i], S.D.lines.o[i], true), tip: (i) => fmtFull(S.D.lines.t[i], S.D.lines.o[i]) },
       { label: "source", w: "70px", get: (i) => srcBadge(S.D.lines.sources[S.D.lines.s[i]]) },
-      { label: "level", w: "60px", get: (i) => { const l = S.D.lines.levels[S.D.lines.l[i]]; const r = LEVEL_RANK[l] || 0; return r ? h("span", { class: r > 1 ? "lvl-err" : "lvl-warn" }, l) : ""; } },
+      { label: "level", w: "64px", title: LEVEL_NOTE, get: (i) => levelBadge(S.D.lines.levels[S.D.lines.l[i]]) },
       { label: "category", w: "120px", get: (i) => S.D.lines.cats[S.D.lines.c[i]] },
       { label: "message", w: "minmax(0, 1fr)", cls: "msg", get: (i) => (S.D.lines.extra[i] ? `${S.D.lines.m[i]}  ⏎` : S.D.lines.m[i]) },
     ],
@@ -307,7 +336,7 @@ const TABS = [
       for (let i = i0; i < i1; i++) {
         if (!srcOn[L.s[i]]) continue;
         if (f.level && (LEVEL_RANK[L.levels[L.l[i]]] || 0) < f.level) continue;
-        if (f.cat >= 0 && L.c[i] !== f.cat) continue;
+        if (f.cat && (L.c[i] !== f.cat[1] || L.s[i] !== f.cat[0])) continue;
         if (m && !m(S.lower[i])) continue;
         out.push(i);
       }
@@ -317,9 +346,20 @@ const TABS = [
       const L = S.D.lines, f = S.f.log;
       const srcCounts = new Map();
       for (const s of L.s) srcCounts.set(s, (srcCounts.get(s) || 0) + 1);
+      // categories per source: Trio's "Alerts" and the pump's are different things
       const catCounts = new Map();
-      for (const c of L.c) catCounts.set(c, (catCounts.get(c) || 0) + 1);
-      const cats = [...catCounts.entries()].filter(([c]) => L.cats[c]).sort((a, b) => L.cats[a[0]].localeCompare(L.cats[b[0]]));
+      for (let i = 0; i < L.c.length; i++) {
+        const k = `${L.s[i]}:${L.c[i]}`;
+        catCounts.set(k, (catCounts.get(k) || 0) + 1);
+      }
+      const bySource = L.sources.map((name, s) => [name, [...catCounts.entries()]
+        .map(([k, n]) => [k.split(":").map(Number), n]).filter(([[ks, c]]) => ks === s && L.cats[c])
+        .sort((a, b) => L.cats[a[0][1]].localeCompare(L.cats[b[0][1]]))]).filter(([, cs]) => cs.length);
+      const catValue = f.cat ? f.cat.join(":") : "";
+      const catSelect = h("select", { "aria-label": "Category", onchange: (e) => { f.cat = e.target.value ? e.target.value.split(":").map(Number) : null; refresh(); } },
+        h("option", { value: "" }, "all categories"),
+        bySource.map(([name, cs]) => h("optgroup", { label: name }, cs.map(([[ks, c], n]) =>
+          h("option", { value: `${ks}:${c}`, selected: `${ks}:${c}` === catValue ? true : null }, `${L.cats[c]} (${thousands(n)})`)))));
       return [
         search(f),
         chips(L.sources.map((s, i) => [s, `${s} ${thousands(srcCounts.get(i) || 0)}`]),
@@ -333,7 +373,7 @@ const TABS = [
             refresh(true);
           }),
         selectBox([["0", "all levels"], ["1", "warnings + errors"], ["2", "errors"]], String(f.level), (v) => { f.level = +v; refresh(); }),
-        selectBox([["-1", "all categories"], ...cats.map(([c, n]) => [String(c), `${L.cats[c]} (${thousands(n)})`])], String(f.cat), (v) => { f.cat = +v; refresh(); }),
+        catSelect,
       ];
     },
     detail: (i) => lineDetail(i),
@@ -501,22 +541,25 @@ const TABS = [
     count: () => S.D.findings.length,
     cols: () => [
       { label: "time", w: "96px", cls: "mono", get: (r) => fmtClock(r.t, rowOff(r)), tip: (r) => fmtFull(r.t, rowOff(r)) },
-      { label: "severity", w: "60px", get: (r) => sevBadge(r.severity) },
-      { label: "check", w: "220px", get: (r) => r.check },
-      { label: "summary", w: "minmax(0, 1fr)", get: (r) => r.summary },
+      { label: "severity", w: "64px", get: (r) => sevBadge(r.severity), title: "Select a finding to see why it got its severity; ⓘ overview explains the scale" },
+      { label: "finding", w: "minmax(260px, 1fr)", get: (r) => kindOf(r).title, tip: (r) => r.check },
+      { label: "what happened", w: "minmax(0, 2fr)", get: (r) => r.summary, tip: (r) => r.summary },
     ],
     rows() {
       const f = S.f.findings, m = matcher(f.q);
       return windowSlice(S.D.findings).filter((r) => (f.sev === "all" || r.severity === f.sev) && (!f.check || r.check === f.check) &&
-        (!m || m(`${r.check} ${r.summary}`)));
+        (!m || m(`${kindOf(r).title} ${r.check} ${r.summary}`)));
     },
     toolbar() {
       const f = S.f.findings;
       return [search(f),
         selectBox([["all", "all severities"], ["high", "high"], ["warn", "warn"], ["info", "info"]], f.sev, (v) => { f.sev = v; refresh(); }),
-        selectBox([["", "all checks"], ...countBy(S.D.findings, (r) => r.check).map(([k, n]) => [k, `${k} (${n})`])], f.check, (v) => { f.check = v; refresh(); })];
+        selectBox([["", "all kinds"], ...countBy(S.D.findings, (r) => r.check).map(([k, n]) => [k, `${kindOf({ check: k }).title} (${n})`])],
+          f.check, (v) => { f.check = v; refresh(); }),
+        h("button", { onclick: showFindingsOverview, title: "What the severities mean, and the findings here grouped by kind" }, "ⓘ overview")];
     },
-    detail: (r) => rowDetail(r, { title: r.check, skip: ["t", "line", "data", "summary", "check"], pre: [["summary", r.summary]], kvs: [["data", r.data]] }),
+    detail: (r) => findingDetail(r),
+    overview: () => findingsOverview(),
     empty: "No findings in this view.",
   },
   {
@@ -562,7 +605,7 @@ function context(i, radius = 12) {
 function kvTable(obj) {
   const t = h("table", { class: "kv" });
   for (const [k, v] of Object.entries(obj || {})) {
-    if (v == null || v === "") continue;
+    if (v == null || v === "" || (typeof v === "object" && !Object.keys(v).length)) continue;
     t.append(h("tr", null, h("td", null, k), h("td", null, typeof v === "object" ? JSON.stringify(v) : String(v))));
   }
   return t;
@@ -573,7 +616,7 @@ function lineMeta(i) {
   const level = L.levels[L.l[i]];
   return h("div", { class: "meta" }, srcBadge(L.sources[L.s[i]]),
     h("span", { class: "mono" }, `${fmtFull(L.t[i], L.o[i])} ${fmtOff(L.o[i])}`),
-    level && level !== "INFO" ? h("span", { class: (LEVEL_RANK[level] || 0) > 1 ? "lvl-err" : (LEVEL_RANK[level] ? "lvl-warn" : "") }, level) : null,
+    level ? h("span", { title: LEVEL_NOTE }, levelBadge(level)) : null,
     L.cats[L.c[i]] ? h("span", null, `[${L.cats[L.c[i]]}]`) : null,
     h("span", { class: "muted" }, `${S.D.files[L.f[i]].name}:${L.n[i]}`));
 }
@@ -602,6 +645,88 @@ function lineDetail(i) {
   ];
 }
 
+const SEVERITIES = ["high", "warn", "info"];
+const kindOf = (r) => (S.D.finding_kinds || {})[r.check] || { title: r.check, what: "", why: {} };
+
+function findingDetail(r) {
+  const k = kindOf(r);
+  const issue = r.issue && (S.D.issues || {})[r.issue];
+  const out = [
+    h("div", { class: "f-title" }, sevBadge(r.severity), h("h2", null, k.title)),
+    h("div", { class: "meta" }, h("span", { class: "mono" }, `${fmtFull(r.t, rowOff(r))} ${fmtOff(rowOff(r))}`),
+      h("span", { class: "mono muted", title: "check id, as `trio-logs findings --check` takes it" }, r.check)),
+    h("h3", null, "What happened"), h("p", { class: "prose" }, r.summary),
+    h("h3", null, "What this check looks for"), h("p", { class: "prose" }, k.what || "—"),
+    h("h3", null, `Why it's ${r.severity}`), h("p", { class: "prose" }, k.why[r.severity] || "No reason recorded for this severity."),
+    h("p", { class: "prose muted" }, `On the scale, ${r.severity} means: ${(S.D.severity_scale || {})[r.severity] || ""} `,
+      h("a", { href: "#", onclick: (e) => { e.preventDefault(); showFindingsOverview(); } }, "all severities")),
+  ];
+  if (issue) {
+    out.push(h("h3", null, "Known issue"), h("p", { class: "prose" }, issue.symptom),
+      h("p", { class: "prose muted" }, `Fix: ${issue.title}${issue.pr ? ` (TandemKit PR #${issue.pr})` : ""}`));
+  }
+  if (r.data && Object.keys(r.data).length) out.push(h("h3", null, "Values the check used"), kvTable(r.data));
+  if (r.line != null) out.push(lineBlock(r.line));
+  return out;
+}
+
+function findingsOverview() {
+  const D = S.D;
+  const all = windowSlice(D.findings);
+  const scope = S.windowOnly && zoomed() ? "in the chart window" : "in this view";
+  const sevCount = Object.fromEntries(countBy(all, (r) => r.severity));
+  const kinds = new Map();
+  for (const r of all) {
+    const g = kinds.get(r.check) || { check: r.check, n: 0, sev: {} };
+    g.n++;
+    g.sev[r.severity] = (g.sev[r.severity] || 0) + 1;
+    kinds.set(r.check, g);
+  }
+  const worst = (g) => Math.min(...Object.keys(g.sev).map((s) => SEVERITIES.indexOf(s)));
+  const groups = [...kinds.values()].sort((a, b) => worst(a) - worst(b) || b.n - a.n);
+  const out = [h("h2", null, "Findings overview"),
+    h("p", { class: "prose" }, all.length ? `${thousands(all.length)} finding${all.length === 1 ? "" : "s"} ${scope}: ` : `No findings ${scope}.`,
+      SEVERITIES.filter((s) => sevCount[s]).map((s) => [sevBadge(s), ` ${sevCount[s]}  `]))];
+  out.push(h("h3", null, "What the severities mean"),
+    h("div", { class: "sev-scale" }, SEVERITIES.map((s) => [sevBadge(s), h("span", null, (D.severity_scale || {})[s] || "")])),
+    h("p", { class: "prose muted" }, "Each kind of finding sets its severity by its own rule, shown when you select one."));
+  if (groups.length) {
+    out.push(h("h3", null, "By kind"), h("p", { class: "prose muted" }, "Click a kind to list only those findings."));
+    for (const g of groups) {
+      const k = kindOf(g);
+      out.push(h("div", { class: "kind-row", role: "button", tabindex: "0", title: `show only ${g.check}`,
+        onclick: () => { S.f.findings.check = g.check; S.f.findings.sev = "all"; refresh(); },
+        onkeydown: (e) => { if (e.key === "Enter") e.currentTarget.click(); } },
+        h("div", { class: "head" }, SEVERITIES.filter((s) => g.sev[s]).map((s) => sevBadge(s)), h("strong", null, k.title),
+          h("span", { class: "n" }, `×${g.n}`)),
+        h("div", { class: "what" }, k.what)));
+    }
+  }
+  return out;
+}
+
+function showFindingsOverview() {
+  if (S.tab !== "findings") setTab("findings");
+  S.sel.findings = null;
+  table.selIndex = -1;
+  table.render();
+  $("#detail").replaceChildren(...[findingsOverview()].flat(Infinity).filter(Boolean));
+  $("#detail").scrollTop = 0;
+}
+
+// what the detail panel shows with no row selected
+function blankDetail(tab) {
+  if (tab.overview && S.D) return tab.overview();
+  return h("p", { class: "muted" }, tab.page ? "" : "Select a row to see its details and the log lines around it.");
+}
+
+function lineBlock(i) {
+  return [h("h3", null, "Log line"), lineMeta(i), h("pre", null, lineText(i)),
+    h("div", { class: "actions" }, h("button", { onclick: () => showInLog(i) }, "show in Log"),
+      copyButton("copy `trio-logs show` command", showCommand(i))),
+    context(i, 8)];
+}
+
 function rowDetail(r, { title, skip = [], kvs = [], pre = [], extraLine = null, extraLabel = "" }) {
   const own = Object.fromEntries(Object.entries(r).filter(([k]) => !skip.includes(k)));
   const out = [h("h3", null, title)];
@@ -609,12 +734,7 @@ function rowDetail(r, { title, skip = [], kvs = [], pre = [], extraLine = null, 
   for (const [label, text] of pre) if (text) out.push(h("div", { class: "muted" }, label), h("pre", null, text));
   out.push(kvTable(own));
   for (const [label, obj] of kvs) if (obj && Object.keys(obj).length) out.push(h("h3", null, label), kvTable(obj));
-  if (r.line != null) {
-    out.push(h("h3", null, "Log line"), lineMeta(r.line), h("pre", null, lineText(r.line)),
-      h("div", { class: "actions" }, h("button", { onclick: () => showInLog(r.line) }, "show in Log"),
-        copyButton("copy `trio-logs show` command", showCommand(r.line))),
-      context(r.line, 8));
-  }
+  if (r.line != null) out.push(lineBlock(r.line));
   if (extraLine != null) {
     out.push(h("h3", null, extraLabel), lineMeta(extraLine), h("pre", null, lineText(extraLine)),
       h("div", { class: "actions" }, h("button", { onclick: () => showInLog(extraLine) }, "show in Log")));
@@ -660,7 +780,7 @@ function setTab(id) {
     $("#detail").replaceChildren(...[tab.detail(row)].flat(Infinity).filter(Boolean));
     table.scrollTo(table.selIndex, true);
   } else {
-    $("#detail").replaceChildren(h("p", { class: "muted" }, tab.page ? "" : "Select a row to see its details and the log lines around it."));
+    $("#detail").replaceChildren(...[blankDetail(tab)].flat(Infinity).filter(Boolean));
     if (!tab.page) {
       const i = S.cursor != null ? indexAt(S.cursor) : -1;
       if (i >= 0) table.scrollTo(i, true);
@@ -699,8 +819,13 @@ function refresh(toolbarToo = true) {
     $("#count").textContent = `${thousands(rows.length)}${typeof total === "number" && total !== rows.length ? ` of ${thousands(total)}` : ""}`;
     table.rowClass = tab.rowClass || null;
     table.onTop = tab.unsorted ? null : (row) => updateTopDay(tab, row);
-    table.set(tab.cols(), rows, S.sel[tab.id], tab.empty);
+    table.set(tab.cols(), rows, S.sel[tab.id], tab.empty, tab.id);
     if (table.selIndex >= 0) table.scrollTo(table.selIndex);
+    if (tab.overview && S.sel[tab.id] == null) {  // keep the overview in step with the chart window
+      const d = $("#detail"), top = d.scrollTop;
+      d.replaceChildren(...[tab.overview()].flat(Infinity).filter(Boolean));
+      d.scrollTop = top;
+    }
   } finally {
     refreshing = false;
   }
@@ -749,7 +874,7 @@ function showInLog(i) {
   if (S.tab !== "log") { S.tab = "log"; renderTabs(); writeHash(); }
   let rows = TAB.log.rows();
   if (!rows.includes(i)) {
-    f.q = ""; f.src = null; f.level = 0; f.cat = -1;
+    f.q = ""; f.src = null; f.level = 0; f.cat = null;
     if (!inWindow(S.D.lines.t[i])) S.windowOnly = false;
     rows = TAB.log.rows();
   }
@@ -1028,7 +1153,7 @@ const chart = {
     }
     for (const n of this.near(x, y).slice(0, 6)) {
       const it = n.item;
-      if (n.kind === "finding") lines.push(h("div", { class: it.severity === "info" ? "" : "bad" }, `◆ ${it.check}: ${it.summary}`));
+      if (n.kind === "finding") lines.push(h("div", { class: it.severity === "info" ? "" : "bad" }, `◆ ${kindOf(it).title}: ${it.summary}`));
       else lines.push(h("div", null, `${fmtClock(it.t, off)} ${it.label}${it.detail ? `: ${it.detail}` : ""}`));
     }
     tip.replaceChildren(...lines);
@@ -1193,7 +1318,7 @@ async function load(key) {
     S.key = key;
     prepare(D);
     renderSummary();
-    $("#detail").replaceChildren(h("p", { class: "muted" }, "Select a row to see the full log line, what was parsed from it, and the lines around it."));
+    $("#detail").replaceChildren(...[blankDetail(TAB[S.tab])].flat(Infinity).filter(Boolean));
     renderTabs();
     chart.render();
     if (S.tab === "history") loadHistory();
@@ -1262,7 +1387,14 @@ async function init() {
   table = new VTable($("#table"));
   table.onSelect = onSelect;
   chart.init();
-  initSplitter();
+  initDividers();
+  const savedCols = loadPref("cols");
+  for (const id of Object.keys(TAB)) {
+    const w = savedCols && savedCols[id];
+    if (w && typeof w === "object") {
+      S.colW[id] = Object.fromEntries(Object.entries(w).filter(([, px]) => Number.isFinite(px) && px >= MIN_COL));
+    }
+  }
   document.addEventListener("keydown", (e) => {
     const typing = e.target.matches("input, select, textarea");
     if (e.key === "/" && !typing) {
@@ -1325,16 +1457,82 @@ async function init() {
   load(src.value.startsWith("p") ? personKey() : src.value);
 }
 
-function initSplitter() {
-  const sp = $("#splitter"), detail = $("#detail");
-  let start = null;
-  sp.addEventListener("mousedown", (e) => { start = { x: e.clientX, w: detail.offsetWidth }; sp.classList.add("drag"); e.preventDefault(); });
-  window.addEventListener("mousemove", (e) => {
-    if (!start) return;
-    const w = Math.max(260, Math.min(window.innerWidth - 320, start.w - (e.clientX - start.x)));
-    detail.style.width = `${w}px`;
+// ------------------------------------------------------------------ resizing
+
+// Sizes the viewer dragged are a per-browser convenience: kept in localStorage when it works, never required.
+const PREFS = "trio-logs.";
+function loadPref(name) {
+  try { return JSON.parse(localStorage.getItem(PREFS + name)); } catch { return null; }
+}
+function savePref(name, value) {
+  try {
+    if (value == null) localStorage.removeItem(PREFS + name);
+    else localStorage.setItem(PREFS + name, JSON.stringify(value));
+  } catch { /* private window or storage blocked: sizes just won't be remembered */ }
+}
+
+const MIN_COL = 36;
+function setColWidth(tab, label, px) {
+  const w = (S.colW[tab] ||= {});
+  if (px == null) delete w[label];
+  else w[label] = Math.max(MIN_COL, Math.round(px));
+}
+function saveColWidths() { savePref("cols", S.colW); }
+
+// Follow one pointer drag on `handle`: onMove(dx, dy) as it moves, onEnd() once it lets go.
+function dragWith(handle, e, onMove, onEnd) {
+  e.preventDefault();
+  const x0 = e.clientX, y0 = e.clientY;
+  handle.setPointerCapture(e.pointerId);
+  handle.classList.add("drag");
+  document.body.classList.add("resizing");
+  const move = (ev) => onMove(ev.clientX - x0, ev.clientY - y0);
+  const done = () => {
+    handle.removeEventListener("pointermove", move);
+    handle.removeEventListener("lostpointercapture", done);
+    handle.classList.remove("drag");
+    document.body.classList.remove("resizing");
+    onEnd();
+  };
+  handle.addEventListener("pointermove", move);
+  handle.addEventListener("lostpointercapture", done);
+}
+
+// A divider that sizes `target` along one axis. grow is +1 when dragging right/down makes the target
+// bigger, -1 when it makes it smaller. Double-click resets to the stylesheet's size; arrow keys nudge.
+function divider(handle, target, { name, prop, grow, bounds, keys }) {
+  let want = null; // the size the viewer chose: a small window squeezes it, a bigger one gives it back
+  const size = () => (prop === "height" ? target.offsetHeight : target.offsetWidth);
+  const clamp = (px) => { const [lo, hi] = bounds(); return Math.round(Math.max(lo, Math.min(Math.max(lo, hi), px))); };
+  const fit = () => { target.style[prop] = want == null ? "" : `${clamp(want)}px`; };
+  const choose = (px) => { want = clamp(px); fit(); };
+  const save = () => savePref(name, want);
+  handle.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    const s0 = size();
+    dragWith(handle, e, (dx, dy) => choose(s0 + grow * (prop === "height" ? dy : dx)), save);
   });
-  window.addEventListener("mouseup", () => { if (start) { start = null; sp.classList.remove("drag"); } });
+  handle.addEventListener("dblclick", () => { want = null; fit(); save(); });
+  handle.addEventListener("keydown", (e) => {
+    const k = keys[e.key];
+    if (!k) return;
+    e.preventDefault();
+    e.stopPropagation();
+    choose(size() + k * (e.shiftKey ? 80 : 20));
+    save();
+  });
+  const saved = loadPref(name);
+  if (typeof saved === "number" && saved > 0) { want = saved; fit(); }
+  window.addEventListener("resize", fit);
+}
+
+function initDividers() {
+  const outer = () => ["#top", "#chart-tools", "#hsplit", "#tabs", "#toolbar"].reduce((sum, q) => sum + $(q).offsetHeight, 0);
+  // the chart keeps room for its lanes; the table keeps room for a handful of rows
+  divider($("#hsplit"), $("#chart"), { name: "chartHeight", prop: "height", grow: 1,
+    bounds: () => [180, window.innerHeight - outer() - 140], keys: { ArrowUp: -1, ArrowDown: 1 } });
+  divider($("#splitter"), $("#detail"), { name: "detailWidth", prop: "width", grow: -1,
+    bounds: () => [260, window.innerWidth - 320], keys: { ArrowLeft: 1, ArrowRight: -1 } });
 }
 
 init();

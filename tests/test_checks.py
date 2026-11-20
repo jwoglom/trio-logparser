@@ -443,7 +443,7 @@ def test_misdated_dose_is_one_finding_per_dose_however_often_resent(tmp_path):
     found = run("misdated_dose", d)
     assert [(f.data["raw"], f.data["dose"], f.data["sends"]) for f in found] == [
         (RAW_BOLUS, "bolusId 257", 1), (RAW_EXTENDED, "extended bolusId 257", 3)]
-    assert "(3 times)" in found[1].summary
+    assert "(sent 3 times)" in found[1].summary
 
 
 def test_misdated_dose_other_repairs_and_unknown_wording(tmp_path):
@@ -457,7 +457,7 @@ def test_misdated_dose_other_repairs_and_unknown_wording(tmp_path):
     found = run("misdated_dose", d)
     assert kinds(found) == ["misdated_dose.ends_before_start", "misdated_dose.negative_delivery", "misdated_dose.other"]
     assert {f.severity for f in found} == {"warn"}
-    assert "ended 30 min before it started" in found[0].summary and "no pump id" in found[0].summary
+    assert "ends 30 min before it starts" in found[0].summary and "no pump id" in found[0].summary
     assert "history record 9" in found[2].summary
 
 
@@ -497,7 +497,7 @@ def test_history_walk_stepping_deeper_after_each_prune(tmp_path):
     lines = [line for hour, last in ((1, 4000), (2, 3745), (3, 3490)) for line in ratchet_step(hour, last)]
     [f] = run("history_backfill", day(tmp_path, [], lines))
     assert (f.check, f.severity, f.data) == ("history_backfill.prune_ratchet", "warn", {"steps": 3, "lowest": 3236})
-    assert "01:00–03:00" in f.summary
+    assert "Between 01:00 and 03:00" in f.summary
     assert run("history_backfill", day(tmp_path, [], lines[:6])) == []
 
 
@@ -510,8 +510,8 @@ def test_history_prune_followed_by_new_entries_is_no_step(tmp_path):
 
 
 @pytest.mark.parametrize("line, expected", [
-    ("didAdjustPumpClockBy 217067769.0", ("high", "+2512.36 days")),
-    ("didAdjustPumpClockBy -300.4", ("warn", "-300s")),
+    ("didAdjustPumpClockBy 217067769.0", ("high", "forward by 2512.36 days")),
+    ("didAdjustPumpClockBy -300.4", ("warn", "back by 300 s")),
     ("didAdjustPumpClockBy 3.0", None),
 ])
 def test_pump_clock_adjusted(tmp_path, line, expected):
@@ -571,3 +571,17 @@ def test_history_bolus_names_the_raw_the_log_uses(tmp_path):
     [f] = run("history_bolus", d)
     assert f"{RAW_BOLUS} (bolusId 257) 2 U" in f.summary and "extended bolusId 257 1.5 U" in f.summary
     assert [s["raw"] for s in f.data["stale"]] == [RAW_BOLUS, None]
+
+
+def test_every_finding_kind_is_explained():
+    """Each check id a finding can carry has a title, what it looks for, and why it gets its severity."""
+    import inspect
+    import re
+
+    src = inspect.getsource(checks)
+    used = set(re.findall(r'_f\("([a-z_.]+)"', src)) | set(re.findall(r'Finding\("([a-z_.]+)"', src))
+    used |= {f"temp_basal.{sub}" for sub in re.findall(r'sub(?:, why)? = "([a-z_]+)"', src)}
+    assert used == set(checks.KINDS)
+    for name, kind in checks.KINDS.items():
+        assert kind.title and kind.what and kind.why, name
+        assert set(kind.why) <= set(checks.SEVERITY), name

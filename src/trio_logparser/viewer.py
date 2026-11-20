@@ -22,12 +22,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import analysis, known
+from . import analysis, checks, known
 from . import events as ev
 from .dataset import Day, alias, from_export
 from .export import Header
 from .historylog import RECORD_BYTES
-from .normalize import mask
+from .normalize import CARGO_MASKED, has_serial_field, mask
 from .parse import Record, parse_export, parse_tandem, parse_trio
 
 _EPOCH = datetime(1970, 1, 1)
@@ -439,6 +439,76 @@ def _jsonable(v):
     return v
 
 
+# --------------------------------------------------------------------------- pump line topics
+
+# Every Pump line in an export has the device-log category "delegate", and older tandem logs have
+# none, so the viewer files each one under what it is about instead: from the pump message it
+# carries, else TandemKit's function, else its file. Function names change between builds; a line
+# nothing here matches falls back to its file's name.
+_MESSAGE_NAME = re.compile(r"\b([A-Z]\w+?)(?:Request|Response)\b")
+_MESSAGE_TOPICS = [
+    (re.compile(r"^HistoryLog"), "History"),
+    (re.compile(r"^(SetTempRate|StopTempRate|InitiateBolus|CancelBolus|BolusPermission|SuspendPumping|ResumePumping)"),
+     "Delivery"),
+    (re.compile(r"^((Enter|Exit)(ChangeCartridge|FillTubing)|FillCannula|DetectingCartridge|\w*StateStream)"),
+     "Cartridge & site"),
+    (re.compile(r"^(Dismiss|Acknowledge)"), "Alerts"),
+    (re.compile(r"^(SetMax|Change|SetIDP|CreateIDP|DeleteIDP|RenameIDP|SetActiveIDP|SetModes|SetQuickBolus)"), "Settings"),
+    (re.compile(r"^(Jpake|CentralChallenge|PumpChallenge)"), "Connection"),
+    (re.compile(r"^(Set|Stop|Start|Initiate|Cancel|Suspend|Resume|Enter|Exit|Fill|Remote|Create|Delete|Rename|Play)"),
+     "Other commands"),
+]
+_FUNC_TOPICS = {
+    "handleHistoryLogStreamPacket": "History",
+    "handleQualifyingEvents": "Status reads", "ensureCurrentPumpData": "Status reads",
+    "syncDeliveryLimits": "Settings",
+    "handleControlStreamPacket": "Cartridge & site",
+    "performInitialSetup": "Connection", "peripheral": "Connection", "linkWentDown": "Connection",
+    "didReconnect": "Connection", "read": "Connection",
+}
+_FUNC_PATTERNS = [
+    (re.compile(r"(?i)cartridge|tubing|cann?ull?a|sitechange"), "Cartridge & site"),
+    (re.compile(r"(?i)alert|alarm|notification"), "Alerts"),
+    (re.compile(r"(?i)history"), "History"),
+    (re.compile(r"(?i)bolus|basal|deliver|suspend|resume|pendingpumpevents"), "Delivery"),
+]
+_FILE_TOPICS = [
+    (re.compile(r"History"), "History"),
+    (re.compile(r"HostDoseDates|BasalReconciliation|DeliveryTransitions"), "Delivery"),
+    (re.compile(r"Bluetooth|Peripheral"), "Connection"),
+    (re.compile(r"Alert|Notification"), "Alerts"),
+]
+
+
+@functools.cache
+def _pump_topic(file: str, func: str, message: str | None) -> str:
+    if message:
+        return next((t for rx, t in _MESSAGE_TOPICS if rx.match(message)), "Status reads")
+    if t := _FUNC_TOPICS.get(func):
+        return t
+    stem = file.removesuffix(".swift")
+    if t := next((t for rx, t in _FILE_TOPICS if rx.search(stem)), None):
+        return t
+    if t := next((t for rx, t in _FUNC_PATTERNS if rx.search(func)), None):
+        return t
+    return stem.removeprefix("TandemPumpManager+") or "TandemKit"
+
+
+def pump_topic(r: Record) -> str:
+    """What a pump driver line is about (Delivery, Status reads, History, Connection, ...)."""
+    if not r.file:  # another driver's free-form line: nothing to go on but its own category
+        return r.category or "Pump"
+    m = _MESSAGE_NAME.search(r.msg) if "message" in r.msg else None
+    return _pump_topic(r.file, r.func.split("(")[0], m.group(1) if m else None)
+
+
+def _mask_cargo(fields: dict) -> dict:
+    """A parsed message's fields, with its cargo hidden if it carries a serial number."""
+    if "cargo" in fields and has_serial_field(fields):
+        return {**fields, "cargo": CARGO_MASKED}
+    return fields
+
+
 class _Interner:
     def __init__(self):
         self.items: list[str] = []
@@ -469,7 +539,7 @@ def bundle(sel: Selection, *, names: bool = False, unmasked: bool = False) -> di
         col["o"].append(off)
         col["s"].append(sources(r.source or ("Pump" if r.src == "tandem" else "Trio")))
         col["l"].append(levels(r.level))
-        col["c"].append(cats(r.category))
+        col["c"].append(cats(pump_topic(r) if r.src == "tandem" else r.category))
         col["m"].append(m(r.msg))
         col["f"].append(fi)
         col["n"].append(r.lineno)
@@ -496,17 +566,20 @@ def bundle(sel: Selection, *, names: bool = False, unmasked: bool = False) -> di
     comms = pump_comms(tandem)
     dose_rows = doses(trio, tandem, comms, lines, times)
     for c in comms:
-        c["fields"] = _jsonable(c["fields"])
+        c["fields"] = _jsonable(c["fields"] if unmasked else _mask_cargo(c["fields"]))
         if "response_fields" in c:
-            c["response_fields"] = _jsonable(c["response_fields"])
+            c["response_fields"] = _jsonable(c["response_fields"] if unmasked else _mask_cargo(c["response_fields"]))
 
     res = analysis.run(None, loaded=sel.days, headers={sel.person: sel.headers} if sel.headers else None)
     findings = []
+    issues: dict[str, dict] = {}
     for f in res.findings:
         d = res.day(f.person, f.day)
         p = d.path(f.src) if d else None
         line = where.get((fidx.get(p), f.lineno)) if p in fidx else None
         issue = known.for_check(f.check)
+        if issue:
+            issues[issue.id] = {"title": issue.title, "pr": issue.pr, "symptom": issue.symptom}
         findings.append({"t": times[line] if line is not None else epoch_ms(f.ts, lines[0][1].tz if lines else "+0000"),
                          "line": line, "check": f.check, "severity": f.severity, "summary": m(f.summary),
                          "issue": issue.id if issue else None, "data": _jsonable(f.data)})
@@ -528,6 +601,8 @@ def bundle(sel: Selection, *, names: bool = False, unmasked: bool = False) -> di
         for k in ("msg", "what"):
             if isinstance(data.get(k), str):
                 data[k] = m(data[k])
+        if not unmasked:
+            row[2] = _mask_cargo(data)
 
     who = sel.person if names else alias(sel.person)
     return {
@@ -551,6 +626,10 @@ def bundle(sel: Selection, *, names: bool = False, unmasked: bool = False) -> di
         "comms": comms,
         "markers": markers(sorted(trio + tandem, key=lambda x: x[1])),
         "findings": findings,
+        # what each finding's check means and why it got its severity (checks.KINDS / SEVERITY)
+        "finding_kinds": {k: {"title": v.title, "what": v.what, "why": v.why} for k, v in checks.KINDS.items()},
+        "severity_scale": checks.SEVERITY,
+        "issues": issues,
         "history_packets": sum(1 for _, r in lines if "HistoryLogStreamResponse" in r.msg),
     }
 

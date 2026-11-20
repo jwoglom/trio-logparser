@@ -95,7 +95,9 @@ analyzed and `scan` says so. Builds come from each `Trio started` line and, for 
 with no launch in them, from the saved export header's `== App ==` section.
 
 Testers are shown as initials by default (`--names` for full names). `show` masks pump serials,
-transmitter IDs and emails; still treat its output as health data. A TandemKit dose's `raw`
+transmitter IDs and emails; still treat its output as health data. A message's `cargo` (its raw
+bytes) is shown, except on a message with a serial-number field (`PumpVersionBResponse`), whose
+cargo encodes that serial. A TandemKit dose's `raw`
 (`0101…`–`0105…`, 20 hex digits) is left as Trio's export prints it, so findings and `show` use the
 same dose ids as the log; findings add the pump id it names (`bolusId 123`). It embeds the pump
 serial in bytes 2–5: keep real ones out of anything public.
@@ -114,17 +116,19 @@ double-click for everything; clicking moves the table below to that time. Tabs:
 
 | Tab | Rows |
 |---|---|
-| Log | Every line, all sources merged in time order; filter by source, level, category, text or `/regex/`. |
+| Log | Every line, all sources merged in time order; filter by source, level, category, text or `/regex/`. Pump lines are filed by what they're about (Delivery, Status reads, History, Connection, Alerts, Settings, Cartridge & site), from the message or TandemKit function behind them; every export Pump line has the same device-log category, `delegate`. Trio's export prints a level only on warnings and errors, so its other lines (and CGM and oref lines) show as INFO. |
 | Insulin | Each delivery action as Trio (request, outcome, the dose it stored), the driver (TandemKit's lines) and the pump (the request on the wire and its status) saw it. |
 | CGM | Readings. Dexcom G7 live and backfill messages are dated by the sensor; for other CGMs, the BG each loop started from. |
 | Loop & oref | Each `Algorithm` determination (BG, IOB, COB, eventual BG, temp, SMB, ISF, CR, target, autosens, insulinReq, reason) and what Trio did next. |
 | Pump comms | Each request with its outcome (response, timeout, cancelled, refused, disconnect, none logged) and latency. |
 | Pump history | The records the logged history-log stream packets carry, by sequence number, with how often each was read. |
-| Findings | The checks' findings (as `findings`). |
+| Findings | The checks' findings (as `findings`), each with a plain title. Selecting one shows what happened, what its check looks for, why it got its severity, and any known issue behind it; with none selected, an overview explains the severity scale and groups the findings by kind. |
 | Export & builds | The export header and the builds running. |
 
 Every row opens its log line, with the lines around it and its `trio-logs show` command. By
-default "chart window only" limits the tables to the zoomed time window.
+default "chart window only" limits the tables to the zoomed time window. Drag the line under the
+chart or beside the detail panel to resize them, and a column header's right edge to resize that
+column (double-click any of these to reset); the browser remembers the sizes.
 
 - **Pump history** is decoded with TandemKit's own classes, as `history-jsonl` does: with
   `--tandemkit-repo` (or `$TANDEMKIT_REPO`) the decoder is built for `--tandemkit-rev` on first use;
@@ -148,7 +152,7 @@ default "chart window only" limits the tables to the zoomed time window.
 | parse | `parse.py`, `export.py` | Lines → records. Exports: `Pump` lines are the tandem side, the rest the trio side; indented continuation lines attach to the record above; `export.py` reads headers and splits and merges export days. Older logs: Trio continuation lines (JSON, tables) attach to the record above; tandem lines without a header are **torn** (TandemLogger's unlocked seek-then-write let a shorter concurrent write overwrite a longer one's start; a fully overwritten line vanishes: **lost**). Exports come from Trio's own stores and are never torn. |
 | events | `events.py` | Records → typed events by message text (function names and line numbers change per build). Every `Writing message:` / `Received message:` becomes `pump_request` / `pump_response` with parsed fields. |
 | builds | `builds.py` | Each launch line (`Trio started: v… <branch> <commit>; … TandemKit <sha>`, or the older `Trio Started … [Branch: …]`) starts a build; an export header's `== App ==` build covers its window when no launch is logged in it; days inherit the build running when they begin. |
-| checks | `checks.py` | Each finding points at a log line. Severity `high` = Trio and the pump disagree about insulin, `warn` = something failed or went missing, `info` = expected but counted. |
+| checks | `checks.py` | Each finding points at a log line. `KINDS` gives each check id a title, what it looks for, and why it gets each severity it can have; `SEVERITY` is the scale: `high` points to a wrong insulin record (Trio and the pump disagree about what was delivered, or doses or the pump clock are dated far from real time), `warn` = something failed, was slow, went missing or didn't match, `info` = context (normal events, gaps in the log). |
 | known issues | `known.py`, `known_issues.json` | TandemKit fixes with log signatures. A symptom on a build without the fix is *fixed later*; on a build with it, *regression?* — flagged only for **definitive** signatures (the fix removed that log text). |
 | web | `viewer.py`, `web.py`, `web/` | `viewer.py` parses a view once and derives its tables (CGM, oref, doses, pump comms, pump IOB, markers, findings, pump history), each row pointing at its line; `web.py` serves them as JSON on loopback; `web/` is the page (plain JS, no dependencies; log text only ever enters it as DOM text). |
 
@@ -161,8 +165,8 @@ Checks:
 - `bolus.*` — Trio's bolus outcome vs TandemKit's enact / `InitiateBolusRequest` (paired 1:1 by
   amount): `units_mismatch`, `failed_but_initiated`, `concurrent_enact`, `stopped_early` (pump's
   `LastBolusStatus` delivered < requested, with the pump's stop reason), `permission_denied`.
-- `pump_request.*` — each request's response: `late` (> 30 s), `duplicate_in_flight`, `missing`,
-  `timeout`, `disconnect`, `torn_line`.
+- `pump_request.*` — each request's outcome: `late` (answered after 30 s with no timeout logged),
+  `timeout`, `disconnect`, `missing` (the log ends first), `outcome_line_lost`.
 - `loop_gap` — > 15 min without a successful loop, annotated with failures, missing glucose,
   pump disconnects, and silent-log stretches.
 - `misdated_dose.*` — TandemKit's `Misdated …` errors: a dose whose dates it replaced before sending

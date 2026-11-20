@@ -88,7 +88,7 @@ body {
   color: var(--fg);
   font: 13px/1.4 var(--sans);
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
   overflow: hidden;
 }
 button, select, input { font: inherit; color: inherit; }
@@ -132,7 +132,7 @@ input[type="number"] { width: 70px; }
 #mask-badge.unmasked { background: var(--err-bg); color: var(--err); font-weight: 600; }
 
 /* chart */
-#chart-wrap { position: relative; border-bottom: 1px solid var(--line); user-select: none; }
+#chart-wrap { position: relative; user-select: none; }
 #chart-tools {
   display: flex;
   align-items: center;
@@ -239,8 +239,12 @@ input[type="number"] { width: 70px; }
 #content { display: flex; min-height: 0; }
 #table, #page { flex: 1; min-width: 0; }
 #page { overflow: auto; padding: 12px 16px; }
-#splitter { width: 5px; cursor: col-resize; background: var(--line); flex: none; }
-#splitter:hover, #splitter.drag { background: var(--accent); }
+/* draggable dividers */
+.divider { background: var(--line); flex: none; touch-action: none; }
+.divider:hover, .divider.drag, .divider:focus-visible { background: var(--accent); outline: none; }
+#hsplit { height: 5px; cursor: row-resize; }
+#splitter { width: 5px; cursor: col-resize; }
+body.resizing, body.resizing * { user-select: none; }
 #detail { width: 36%; min-width: 280px; overflow: auto; padding: 10px 14px; flex: none; }
 
 /* virtual table */
@@ -260,11 +264,18 @@ input[type="number"] { width: 70px; }
 .vt-cell { overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
 .vt-cell.mono, .vt-cell.msg { font-family: var(--mono); font-size: 12px; }
 .vt-cell.num { text-align: right; }
+.vt-head .vt-cell { position: relative; overflow: visible; }
+.vt-label { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* column resize grip: sits in the gap to the right of each header cell */
+.col-grip { position: absolute; top: -3px; bottom: -3px; right: -9px; width: 8px; cursor: col-resize; z-index: 1; touch-action: none; }
+.col-grip::after { content: ""; position: absolute; left: 3px; top: 4px; bottom: 4px; width: 1px; background: var(--line); }
+.col-grip:hover::after, .col-grip.drag::after { left: 2px; width: 3px; top: 0; bottom: 0; background: var(--accent); }
 .vt-empty { padding: 20px; color: var(--fg3); }
 .bad { color: var(--err); }
 .good { color: var(--ok); }
 .lvl-warn { color: var(--warn); font-weight: 600; }
 .lvl-err { color: var(--err); font-weight: 600; }
+.lvl-info { color: var(--fg3); }
 
 .src { display: inline-block; font-size: 10.5px; line-height: 15px; padding: 0 6px; border-radius: 8px; color: #fff; font-weight: 600; }
 .src-trio { background: var(--src-trio); }
@@ -281,6 +292,19 @@ input[type="number"] { width: 70px; }
 /* detail */
 #detail h3 { font-size: 13px; margin: 14px 0 6px; color: var(--fg2); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
 #detail h3:first-child { margin-top: 2px; }
+#detail h2 { font-size: 15px; margin: 2px 0 6px; }
+.f-title { display: flex; gap: 8px; align-items: center; }
+#detail a { color: var(--accent); }
+.f-title h2 { margin: 0; }
+.prose { margin: 4px 0 8px; line-height: 1.5; max-width: 72ch; }
+.prose.muted { font-size: 12px; }
+.sev-scale { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px 10px; align-items: baseline; line-height: 1.45; }
+.sev-scale .sev { justify-self: start; }
+.kind-row { padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; margin: 6px 0; cursor: pointer; }
+.kind-row:hover, .kind-row:focus-visible { background: var(--hover); outline: none; }
+.kind-row .head { display: flex; gap: 6px; align-items: center; }
+.kind-row .n { margin-left: auto; color: var(--fg2); font-variant-numeric: tabular-nums; }
+.kind-row .what { color: var(--fg2); font-size: 12px; margin-top: 3px; line-height: 1.4; }
 #detail .meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; color: var(--fg2); font-size: 12px; }
 #detail pre, #page pre {
   font-family: var(--mono);
@@ -319,7 +343,7 @@ table.kv td:last-child { font-family: var(--mono); word-break: break-word; }
 
 @media (max-width: 900px) {
   #content { flex-direction: column; }
-  #detail { width: auto; height: 40%; border-top: 1px solid var(--line); }
+  #detail { width: auto !important; height: 40%; border-top: 1px solid var(--line); }
   #splitter { display: none; }
   input[type="search"] { width: 160px; }
 }

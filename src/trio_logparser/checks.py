@@ -1,9 +1,7 @@
 """Checks over parsed log days. Each yields Findings that point at a log line.
 
-Severity:
-  high  Trio and the pump disagree about insulin delivered, or a safety-relevant state.
-  warn  Something failed or went missing that should not have.
-  info  Expected-but-worth-counting behavior (disconnect-aborted requests, torn log lines).
+Every finding's check id has an entry in ``KINDS``: a plain title, what the check looks for, and
+why a finding of it gets the severity it does (``SEVERITY`` is the scale).
 """
 
 from __future__ import annotations
@@ -95,8 +93,8 @@ CLAIM_WINDOW = 60  # s from a TandemKit "Setting temp basal"/"Enacting bolus" li
 
 
 def _lost(d: Day, e: Event, what: str) -> Finding:
-    return _f("log_line_lost", "info", d, e, f"{e.data['name']} sent with no preceding '{what}' line "
-              "(line lost from tandem log)", request=e.data["name"])
+    return _f("log_line_lost", "info", d, e, f"TandemKit sent {e.data['name']} without the '{what}' line that "
+              "comes first; that line was lost from the log", request=e.data["name"])
 
 
 def pump_temp_basals(d: Day) -> tuple[list[Event], list[Finding]]:
@@ -142,8 +140,8 @@ def pump_boluses(d: Day) -> tuple[list[Event], list[Finding]]:
         if e.kind == "bolus_enact":
             if pending:
                 found.append(_f("bolus.concurrent_enact", "warn", d, e,
-                                f"bolus {e.data['units']:g} U enacted while bolus {pending[-1].data['units']:g} U "
-                                "was still being initiated", units=e.data["units"],
+                                f"A {e.data['units']:g} U bolus started while a {pending[-1].data['units']:g} U "
+                                "bolus was still being set up", units=e.data["units"],
                                 other_units=pending[-1].data["units"]))
             e.data.pop("bolus_id", None)
             out.append(e)
@@ -195,7 +193,8 @@ def temp_basal(d: Day) -> Iterator[Finding]:
         if s is None:
             if ok and d.covered("tandem", e.ts):
                 yield _f("temp_basal.unconfirmed", "warn", d, e,
-                         f"Trio logged temp basal {e.data['rate']} U/hr succeeded; TandemKit never set one",
+                         f"Trio logged a {e.data['rate']:g} U/hr temp basal as succeeded; TandemKit logged no "
+                         "command for it",
                          rate=e.data["rate"])
             continue
         trio_rate, pump_rate = e.data["rate"], s.data["rate"]
@@ -206,16 +205,17 @@ def temp_basal(d: Day) -> Iterator[Finding]:
                     "result": e.data["result"], "profile": s.data.get("profile")}
             if pump_rate == 0 and 0 < trio_rate < MIN_TEMP_RATE:
                 yield _f("temp_basal.below_min_rate", "info", d, e,
-                         f"Trio {e.data['result']} {trio_rate:g} U/hr; TandemKit set and reported 0 (below the "
-                         f"pump's {MIN_TEMP_RATE} U/hr minimum)", **info)
+                         f"Trio logged a {trio_rate:g} U/hr temp basal as {e.data['result']}; TandemKit set "
+                         f"0 U/hr, since the pump's lowest non-zero rate is {MIN_TEMP_RATE} U/hr", **info)
             elif 0 < diff <= step + 1e-9:
                 yield _f("temp_basal.rate_rounded_down", "warn", d, e,
-                         f"Trio {e.data['result']} {trio_rate:g} U/hr; TandemKit set {pump_rate:g} "
-                         f"(rounded down ≤ one step of {step:.3g})", **info)
+                         f"Trio logged a {trio_rate:g} U/hr temp basal as {e.data['result']}; TandemKit set "
+                         f"{pump_rate:g} U/hr, rounded down by no more than one {step:.3g} U/hr step", **info)
             else:
                 yield _f("temp_basal.rate_mismatch", "high" if diff > 0 else "warn", d, e,
-                         f"Trio {e.data['result']} {trio_rate:g} U/hr but TandemKit set {pump_rate:g} U/hr "
-                         f"(Trio {'higher' if diff > 0 else 'lower'} by {abs(diff):g})", **info)
+                         f"Trio logged a {trio_rate:g} U/hr temp basal as {e.data['result']}, but TandemKit set "
+                         f"{pump_rate:g} U/hr ({abs(diff):g} U/hr {'lower' if diff > 0 else 'higher'} than "
+                         "Trio's)", **info)
         nxt = next((x.lineno for x in sets.events if x.lineno > s.lineno), None)
         enacted = next((o for o in outcomes.events if s.lineno < o.lineno
                         and (nxt is None or o.lineno < nxt) and o.kind == "tb_enacted"), None)
@@ -225,32 +225,35 @@ def temp_basal(d: Day) -> Iterator[Finding]:
             delivered = status.data.get("currentBasalRate") if status else None
             profile = status.data.get("profileBasalRate") if status else None
             if isinstance(delivered, (int, float)) and trio_rate - delivered > max(0.05, trio_rate * 0.1):
+                rate = f"{profile:g} U/hr" if isinstance(profile, (int, float)) else "(unknown)"
                 if isinstance(profile, (int, float)) and profile and \
                         abs(delivered - MAX_TEMP_PERCENT / 100 * profile) < 0.01:
-                    sub, why = "clamped_max_percent", f"clamped to {MAX_TEMP_PERCENT}% of the pump profile"
+                    sub, why = "clamped_max_percent", f"its cap of {MAX_TEMP_PERCENT}% of the {rate} profile rate"
                 else:
                     # delivered == percent x pump profile, but the percent was computed from another rate
-                    sub, why = "pump_profile_differs", "percent computed against a different basal rate"
+                    sub = "pump_profile_differs"
+                    why = f"TandemKit worked the percent out from a basal rate other than the pump's {rate} profile rate"
                 # TandemKit reports the clamped rate as the dose, so only the request went unmet;
                 # with a differing profile (pre-#500) the reported dose itself was wrong
                 yield _f(f"temp_basal.{sub}", "warn" if sub == "clamped_max_percent" else "high", d, e,
-                         f"Trio recorded temp basal {trio_rate:g} U/hr; pump then reported delivering "
-                         f"{delivered:g} U/hr (pump profile {profile} U/hr: {why})",
+                         f"Trio set a {trio_rate:g} U/hr temp basal; the pump then reported running "
+                         f"{delivered:g} U/hr: {why}",
                          trio_rate=trio_rate, pump_current=delivered, pump_profile=profile)
         if not ok and enacted:
             yield _f("temp_basal.failed_but_enacted", "high", d, e,
-                     f"Trio logged temp basal {e.data['rate']} U/hr FAILED but TandemKit logged "
-                     f"'Temp basal enacted!' for it at {enacted.ts:%H:%M:%S}", rate=e.data["rate"])
+                     f"Trio logged a {e.data['rate']:g} U/hr temp basal as failed, but TandemKit logged it "
+                     f"enacted at {enacted.ts:%H:%M:%S}", rate=e.data["rate"])
     paired = {id(s) for s in matched.values()}
     for s in sets.events:
         if id(s) not in paired and d.covered("trio", s.ts, 0):
             yield _f("temp_basal.no_trio_outcome", "warn", d, s,
-                     f"TandemKit set temp basal {s.data['rate']} U/hr; Trio logged no outcome",
+                     f"TandemKit set a {s.data['rate']:g} U/hr temp basal; Trio logged no outcome for it",
                      rate=s.data["rate"])
     for r in d.tandem:
         if r.kind == "pump_response" and r.data.get("name") == "SetTempRateResponse" and r.data.get("status"):
             yield _f("temp_basal.pump_rejected", "warn", d, r,
-                     f"SetTempRateResponse status={r.data['status']}", status=r.data["status"])
+                     f"The pump answered SetTempRateRequest with status {r.data['status']} (not taken)",
+                     status=r.data["status"])
 
 
 # --------------------------------------------------------------------------- bolus
@@ -287,12 +290,14 @@ def bolus(d: Day) -> Iterator[Finding]:
             if s is None:
                 if e.data["result"] == "succeeded" and d.covered("tandem", e.ts):
                     yield _f("bolus.unconfirmed", "warn", d, e,
-                             f"Trio logged bolus {e.data['units']} U succeeded; TandemKit never enacted one",
+                             f"Trio logged a {e.data['units']:g} U bolus as succeeded; TandemKit logged no "
+                             "command for it",
                              units=e.data["units"])
                 continue
             if abs(s.data["units"] - e.data["units"]) > 1e-6:
                 yield _f("bolus.units_mismatch", "high", d, e,
-                         f"Trio bolus {e.data['units']} U {e.data['result']} but TandemKit enacted {s.data['units']} U",
+                         f"Trio logged a {e.data['units']:g} U bolus as {e.data['result']}, but TandemKit sent "
+                         f"{s.data['units']:g} U",
                          trio_units=e.data["units"], pump_units=s.data["units"])
             if e.data["result"] == "failed" and s.data.get("bolus_id") is not None:
                 resp = next((r for r in d.tandem if r.kind == "pump_response" and r.lineno > s.lineno
@@ -300,8 +305,8 @@ def bolus(d: Day) -> Iterator[Finding]:
                              and r.data.get("bolusId") == s.data["bolus_id"]), None)
                 if resp and resp.data.get("status") == 0 and "succ" in str(resp.data.get("statusType", "")).lower():
                     yield _f("bolus.failed_but_initiated", "high", d, e,
-                             f"Trio logged bolus {e.data['units']} U FAILED but the pump accepted it "
-                             f"(InitiateBolusResponse bolusId={resp.data.get('bolusId')})", units=e.data["units"])
+                             f"Trio logged a {e.data['units']:g} U bolus as failed, but the pump accepted it "
+                             f"(bolusId {resp.data.get('bolusId')})", units=e.data["units"])
     else:
         lost = pump_boluses(d)[1] if d.tandem else []
     yield from lost
@@ -316,7 +321,8 @@ def bolus(d: Day) -> Iterator[Finding]:
             if e.data.get("name") == "BolusPermissionResponse" and e.data.get("nackReason") not in (
                     None, "permissionGranted"):
                 yield _f("bolus.permission_denied", "info", d, e,
-                         f"BolusPermission nack: {e.data.get('nackReason')}", nack=e.data.get("nackReason"))
+                         f"The pump refused bolus permission: {e.data.get('nackReason')}",
+                         nack=e.data.get("nackReason"))
         if e.kind == "bolus_cancel" or (e.kind == "pump_request" and e.data.get("name") == "CancelBolusRequest"):
             cancels.append(e.ts)
     cancels += [e.ts for e in d.trio if e.kind == "trio_bolus_cancel"]
@@ -328,8 +334,8 @@ def bolus(d: Day) -> Iterator[Finding]:
         cancelled = any(abs((c - e.ts).total_seconds()) < 3600 for c in cancels)
         sev = "info" if code in (0, 4) and cancelled else "warn"
         yield _f("bolus.stopped_early", sev, d, e,
-                 f"bolusId={bid} delivered {st['delivered'] / 1000:g} of {st['requested'] / 1000:g} U: "
-                 f"{reason}{'' if cancelled else ' (no cancel in logs)'}",
+                 f"bolusId {bid} delivered {st['delivered'] / 1000:g} of {st['requested'] / 1000:g} U: "
+                 f"{reason}{'' if cancelled else '; no cancel in the logs'}",
                  **st, reason=reason, cancelled=cancelled)
 
 
@@ -337,6 +343,9 @@ def bolus(d: Day) -> Iterator[Finding]:
 
 MISDATED_HIGH = 3600  # s ahead of the phone: no nudge, but a stamp from another pump clock
 DAY_S = 86400
+
+DOSE_TYPES = {"tempBasal": "temp basal", "basal": "basal", "bolus": "bolus", "suspend": "suspend",
+              "resume": "resume"}
 
 # TandemKit's HistoryLogSyncIdentifier: version 1, a scheme byte, the pump serial, then the id named here.
 _SYNC_ID = {1: "bolusId", 2: "tempRateId", 3: "history record", 4: "extended bolusId", 5: "tempRateId"}
@@ -371,8 +380,10 @@ def misdated_dose(d: Day) -> Iterator[Finding]:
     for (kind, raw), sends in doses.items():
         e = sends[0]
         problem = e.data["problem"]
-        what = f"{kind} {raw} ({dose_label(raw)})" if raw else f"{kind} ({dose_label(raw)})"
-        times = f" ({len(sends)} times)" if len(sends) > 1 else ""
+        name = DOSE_TYPES.get(kind, kind)
+        what = f"{name} {raw} ({dose_label(raw)})" if raw else f"{name} ({dose_label(raw)})"
+        cap = what[:1].upper() + what[1:]
+        times = f" (sent {len(sends)} times)" if len(sends) > 1 else ""
         info = {"type": kind, "raw": raw, "dose": dose_label(raw), "sends": len(sends), **problem}
         if (ahead := problem.get("start_ahead")) is not None:
             # the host counts a bolus from its start, so one moved to now is insulin it thinks is fresh
@@ -380,19 +391,21 @@ def misdated_dose(d: Day) -> Iterator[Finding]:
             end = e.data["sent_end"]
             runs_on = f", ending {end:%Y-%m-%d}" if (end - e.data["sent_start"]).total_seconds() > DAY_S else ""
             yield _f("misdated_dose.start_ahead", sev, d, e,
-                     f"{what} was stamped {_span(ahead)} ahead of the phone's clock; TandemKit sent it "
-                     f"to the host as starting now{runs_on}{times}", **info)
+                     f"{cap} is dated {_span(ahead)} ahead of the phone's clock; TandemKit sent it to Trio "
+                     f"as starting now{runs_on}{times}", **info)
         elif (short := problem.get("ends_before_start")) is not None:
             yield _f("misdated_dose.ends_before_start", "warn", d, e,
-                     f"{what} ended {_span(short)} before it started; TandemKit sent it with no length{times}",
+                     f"{cap} ends {_span(short)} before it starts; TandemKit sent it to Trio with no "
+                     f"duration{times}",
                      **info)
         elif "negative_delivery" in problem:
             yield _f("misdated_dose.negative_delivery", "warn", d, e,
-                     f"{what} had {problem['negative_delivery']:g} U delivered; TandemKit sent it as 0 U{times}",
+                     f"{cap} works out to {problem['negative_delivery']:g} U delivered; TandemKit sent it to "
+                     f"Trio as 0 U{times}",
                      **info)
         else:  # wording this build of the parser does not know
             yield _f("misdated_dose.other", "warn", d, e,
-                     f"{what} had dates TandemKit replaced before sending it{times}", **info)
+                     f"TandemKit replaced the dates of {what} before sending it to Trio{times}", **info)
 
 
 # --------------------------------------------------------------------------- pump history
@@ -442,9 +455,9 @@ def history_bolus(d: Day) -> Iterator[Finding]:
                   for b, _ in list(stale.values())[:4]]
         count = e.data["count"]
         yield _f("history_bolus.stale", "high", d, e,
-                 f"TandemKit reported {count} bolus{'es' if count != 1 else ''} from pump history right after "
-                 f"reading {len(stale)} bolus record{'s' if len(stale) != 1 else ''} stamped "
-                 f"{_span(min(abs(o) for _, o in stale.values()))} or more from the phone's clock: "
+                 f"TandemKit sent Trio {count} bolus{'es' if count != 1 else ''} from pump history right after "
+                 f"reading {len(stale)} bolus record{'s' if len(stale) != 1 else ''} dated at least "
+                 f"{_span(min(abs(o) for _, o in stale.values()))} off the phone's clock: "
                  f"{', '.join(listed)}{', …' if len(stale) > len(listed) else ''}",
                  reported=count,
                  stale=[{"record": BOLUS_RECORD[b["type"]], "bolus_id": b["bolus_id"], "units": b["units"],
@@ -477,10 +490,10 @@ def history_backfill(d: Day) -> Iterator[Finding]:
             top = max(top or 0, e.data["last"])
     if len(steps) >= RATCHET_STEPS:
         yield _f("history_backfill.prune_ratchet", "warn", d, steps[0],
-                 f"history walk read {len(steps)} slices deeper {steps[0].ts:%H:%M}–{steps[-1].ts:%H:%M}, each "
-                 f"right after the store pruned the records it had stopped at (down to sequence "
-                 f"{min(s.data['first'] for s in steps)}): the pump's records there are stamped over 90 days "
-                 "before the phone's clock",
+                 f"Between {steps[0].ts:%H:%M} and {steps[-1].ts:%H:%M}, TandemKit read further back in pump "
+                 f"history {len(steps)} times, each right after its history store deleted the records it had "
+                 f"stopped at (back to record #{min(s.data['first'] for s in steps)}); those records are dated "
+                 "more than 90 days before the phone's clock",
                  steps=len(steps), lowest=min(s.data["first"] for s in steps))
 
 
@@ -501,7 +514,7 @@ def pump_request(d: Day) -> Iterator[Finding]:
         if e.kind == "pump_request":
             if pending is not None:
                 yield _f("pump_request.outcome_line_lost", "info", d, pending,
-                         f"{pending.data['name']}: next request written with no outcome logged for this one",
+                         f"{pending.data['name']}: the next command went out with no outcome logged for this one",
                          request=pending.data["name"])
             pending = e
         elif pending is None:
@@ -510,22 +523,25 @@ def pump_request(d: Day) -> Iterator[Finding]:
             latency = (e.ts - pending.ts).total_seconds()
             if latency > RESPONSE_TIMEOUT:
                 yield _f("pump_request.late", "warn", d, pending,
-                         f"{pending.data['name']} answered after {latency:.0f}s with no timeout logged",
+                         f"{pending.data['name']} was answered after {latency:.0f} s, past the {RESPONSE_TIMEOUT} s "
+                         "timeout, with no timeout logged",
                          request=pending.data["name"], latency_s=latency)
             pending = None
         elif e.kind in ("timeout", "write_cancelled", "refused"):
             if e.kind == "timeout":
                 yield _f("pump_request.timeout", "warn", d, pending,
-                         f"{pending.data['name']} timed out after {(e.ts - pending.ts).total_seconds():.0f}s",
+                         f"{pending.data['name']} timed out after {(e.ts - pending.ts).total_seconds():.0f} s "
+                         "with no answer",
                          request=pending.data["name"])
             pending = None
         elif e.kind == "disconnected":
             yield _f("pump_request.disconnect", "info", d, pending,
-                     f"{pending.data['name']} cut off by a disconnect", request=pending.data["name"])
+                     f"{pending.data['name']} was cut off by a disconnect before the pump answered",
+                     request=pending.data["name"])
             pending = None
     if pending is not None:
         yield _f("pump_request.missing", "warn", d, pending,
-                 f"{pending.data['name']}: no outcome logged before the log ends", request=pending.data["name"])
+                 f"{pending.data['name']}: the log ends before any outcome", request=pending.data["name"])
 
 
 # --------------------------------------------------------------------------- connection
@@ -552,7 +568,8 @@ def reconnect_storm(d: Day) -> Iterator[Finding]:
                 if e.kind == "disconnected" and conns[i].ts <= e.ts <= conns[end].ts)
             top = ", ".join(f"{k} ×{v}" for k, v in errs.most_common(2))
             yield _f("reconnect_storm", "warn", d, conns[i],
-                     f"{end - i + 1} connects {conns[i].ts:%H:%M}–{conns[end].ts:%H:%M}; disconnects: {top}",
+                     f"{end - i + 1} pump connections between {conns[i].ts:%H:%M} and {conns[end].ts:%H:%M}; "
+                     f"most common disconnect reasons: {top or 'none logged'}",
                      connects=end - i + 1, minutes=round((conns[end].ts - conns[i].ts).total_seconds() / 60))
             i = end + 1
         else:
@@ -562,6 +579,12 @@ def reconnect_storm(d: Day) -> Iterator[Finding]:
 # --------------------------------------------------------------------------- pump clock
 
 CLOCK_DRIFT_S = 120
+
+
+def _clock_span(seconds: float) -> str:
+    """A clock offset: days to two places past a day (they get matched against pump times), else seconds."""
+    s = abs(seconds)
+    return f"{s / DAY_S:.2f} days" if s > DAY_S else f"{s:.0f} s"
 
 
 @check("pump_clock", f"Pump clock vs phone clock off by > {CLOCK_DRIFT_S}s")
@@ -577,22 +600,22 @@ def pump_clock(d: Day) -> Iterator[Finding]:
                 if not flagged:
                     big = abs(drift) > 86400
                     yield _f("pump_clock.drift", "high" if big else "warn", d, e,
-                             f"pump clock off by {drift / 86400:.2f} days" if big else
-                             f"pump clock off by {drift:+.0f}s",
+                             f"The pump's clock is {_clock_span(drift)} {'ahead of' if drift > 0 else 'behind'} "
+                             "the phone's",
                              drift_s=drift, since_reset=e.data.get("pumpTimeSinceReset"))
                 flagged = True
             else:
                 flagged = False
         elif e.kind == "pump_request" and e.data.get("name") == "ChangeTimeDateRequest":
-            yield _f("pump_clock.set_time", "info", d, e, "TandemKit set the pump's time/date")
+            yield _f("pump_clock.set_time", "info", d, e, "TandemKit set the pump's time and date")
     # Trio's side of a clock write: setup's happens before Trio records the pump's log lines
     for e in d.trio:
         if e.kind == "pump_clock_adjusted" and abs(moved := e.data["seconds"]) > CLOCK_DRIFT_S:
             big = abs(moved) > DAY_S
             yield _f("pump_clock.adjusted", "high" if big else "warn", d, e,
-                     f"TandemKit moved the pump's clock by {moved / DAY_S:+.2f} days; its history from before "
-                     "then carries the old clock's stamps" if big else
-                     f"TandemKit moved the pump's clock by {moved:+.0f}s", moved_s=moved)
+                     f"TandemKit moved the pump's clock {'forward' if moved > 0 else 'back'} by "
+                     f"{_clock_span(moved)}" + ("; pump history from before then carries the old clock's dates"
+                                                if big else ""), moved_s=moved)
 
 
 # --------------------------------------------------------------------------- log health
@@ -601,7 +624,8 @@ def pump_clock(d: Day) -> Iterator[Finding]:
 def torn_lines(d: Day) -> Iterator[Finding]:
     torn = [e for e in d.tandem if e.kind == "torn"]
     if torn:
-        yield _f("torn_lines", "info", d, torn[0], f"{len(torn)} torn line(s) in tandem log",
+        yield _f("torn_lines", "info", d, torn[0],
+                 f"{len(torn)} pump log line{'s' if len(torn) != 1 else ''} partly overwritten by another write",
                  count=len(torn))
 
 
@@ -609,7 +633,7 @@ def torn_lines(d: Day) -> Iterator[Finding]:
 def app_restart(d: Day) -> Iterator[Finding]:
     starts = [e for e in d.trio if e.kind == "app_start"]
     if len(starts) > 3:
-        yield _f("app_restart", "info", d, starts[0], f"Trio started {len(starts)} times",
+        yield _f("app_restart", "info", d, starts[0], f"Trio started {len(starts)} times this day",
                  count=len(starts))
 
 
@@ -639,18 +663,18 @@ def loop_gaps(days: list[Day]) -> Iterator[Finding]:
                 fails = collections.Counter(f.data["error"][:120] for f in failures.window(mid, secs / 2, secs / 2))
                 notes = []
                 if fails:
-                    notes.append("failures: " + "; ".join(f"{k} ×{v}" for k, v in fails.most_common(2)))
+                    notes.append("loop failures: " + "; ".join(f"{k} ×{v}" for k, v in fails.most_common(2)))
                 if not glucose.window(mid, secs / 2 - 60, secs / 2 - 60):
-                    notes.append("no new glucose")
+                    notes.append("no new glucose readings")
                 if n := len(disc.window(mid, secs / 2, secs / 2)):
-                    notes.append(f"{n} pump disconnects")
+                    notes.append(f"{n} pump disconnect{'s' if n != 1 else ''}")
                 silent = [m for m in range(int(secs // 60)) if not d.covered("trio", start + timedelta(minutes=m), 0)]
                 if len(silent) > 10:
-                    notes.append(f"Trio log silent ~{len(silent)} min (app not running?)")
+                    notes.append(f"Trio wrote nothing to its log for ~{len(silent)} min (app not running?)")
                 mins = round(secs / 60)
                 yield Finding("loop_gap", "warn" if mins >= 30 else "info", d.person, d.day, e.ts, "trio",
-                              e.lineno, f"no successful loop for {mins} min "
-                              f"({start:%H:%M}–{e.ts:%H:%M}); {'; '.join(notes) or 'no obvious cause'}",
+                              e.lineno, f"No successful loop for {mins} min ({start:%H:%M}–{e.ts:%H:%M}): "
+                              f"{'; '.join(notes) or 'no cause found in the logs'}",
                               {"minutes": mins, "failures": dict(fails)})
             prev = (d, e)
 
@@ -658,3 +682,197 @@ def loop_gaps(days: list[Day]) -> Iterator[Finding]:
 PERSON_CHECKS: dict[str, tuple[str, Callable]] = {
     "loop_gap": (f"No successful loop for > {LOOP_GAP}", loop_gaps),
 }
+
+
+# --------------------------------------------------------------------------- finding kinds
+
+SEVERITY = {
+    "high": "Points to a wrong insulin record: Trio and the pump disagree about what was delivered, or doses "
+            "(by an hour or more) or the pump's clock (by a day or more) are dated far from real time. Trio "
+            "works out insulin on board from this record. Look at these first.",
+    "warn": "Something failed, was slow, went missing, or didn't match, without the signs of a wrong "
+            "insulin record that make a finding high, or the logs can't tell either way.",
+    "info": "Context: a normal event, or a gap in the log itself. Useful when reading the findings around it.",
+}
+
+
+@dataclass(frozen=True)
+class Kind:
+    title: str  # what happened, in a few plain words
+    what: str  # what the check looks for
+    why: dict[str, str]  # severity -> why a finding of this kind gets it
+
+
+KINDS: dict[str, Kind] = {
+    "log_line_lost": Kind(
+        "Pump log line lost before a command",
+        "TandemKit logs 'Setting temp basal' or 'Enacting bolus' before it sends the command. Here the command "
+        "went out without that line, so the line was lost from the log. Checks that compare Trio with the pump "
+        "use the command itself instead.",
+        {"info": "A gap in the log; the command itself was sent."}),
+    "bolus.concurrent_enact": Kind(
+        "Two boluses started at once",
+        "TandemKit started a bolus while an earlier one was still being set up (within 60 s, before the pump "
+        "answered). With two in flight, one bolus can be matched to the other's outcome.",
+        {"warn": "Not expected; check both boluses' outcomes."}),
+    "temp_basal.unconfirmed": Kind(
+        "Temp basal set, but no pump command",
+        "Trio logged a temp basal as succeeded, but TandemKit logged no matching command in the 2 minutes "
+        "before it, while TandemKit's log was being written.",
+        {"warn": "The logs can't tell whether it was set: the command may be in lines the log lost. If it "
+                 "wasn't set, Trio counts basal insulin the pump didn't give."}),
+    "temp_basal.below_min_rate": Kind(
+        "Temp basal below the pump's minimum",
+        f"Trio asked for a rate under {MIN_TEMP_RATE} U/hr, the lowest non-zero rate TandemKit sends, so "
+        "TandemKit set 0 U/hr and reported 0.",
+        {"info": "Expected: the pump can't run rates that low, and TandemKit reports the 0 it set."}),
+    "temp_basal.rate_rounded_down": Kind(
+        "Temp basal rounded down",
+        "A Tandem temp basal is a whole percent of the pump's profile rate. TandemKit rounded Trio's rate down "
+        "to the percent step below it (builds before TandemKit #357).",
+        {"warn": "The pump runs slightly less than Trio's rate: at most one percent of the profile rate less."}),
+    "temp_basal.rate_mismatch": Kind(
+        "Temp basal rate differs from TandemKit's",
+        "The rate TandemKit sent to the pump differs from the rate Trio logged by more than one percent step "
+        "of the profile rate.",
+        {"high": "The rate TandemKit set is lower than Trio's.",
+         "warn": "The rate TandemKit set is higher than Trio's."}),
+    "temp_basal.clamped_max_percent": Kind(
+        f"Temp basal capped at {MAX_TEMP_PERCENT}%",
+        f"A Tandem temp basal can't go above {MAX_TEMP_PERCENT}% of the pump's own profile rate. Trio asked "
+        "for more, and the pump ran the capped rate.",
+        {"warn": "TandemKit reports the capped rate as the dose, so Trio's record matches what the pump ran; "
+                 "Trio just got less basal than it asked for."}),
+    "temp_basal.pump_profile_differs": Kind(
+        "Temp basal from the wrong basal rate",
+        "TandemKit turns Trio's rate into a percent of the pump's profile rate, but worked the percent out "
+        "from a different basal rate, so the pump ran a rate other than Trio's (builds before TandemKit #500).",
+        {"high": "The dose TandemKit reported doesn't match the rate the pump ran."}),
+    "temp_basal.failed_but_enacted": Kind(
+        "Failed temp basal that was set",
+        "Trio logged a temp basal as failed, but TandemKit logged 'Temp basal enacted!' for it.",
+        {"high": "The pump runs a temp basal Trio thinks failed, so Trio's insulin record may leave it out."}),
+    "temp_basal.no_trio_outcome": Kind(
+        "Temp basal with no Trio outcome",
+        "TandemKit set a temp basal, and Trio's log, which was being written at the time, has no succeeded or "
+        "failed line for it.",
+        {"warn": "The logs can't tell whether Trio recorded it."}),
+    "temp_basal.pump_rejected": Kind(
+        "Pump rejected a temp basal",
+        "The pump answered a SetTempRateRequest with a non-zero status: it didn't take the temp basal.",
+        {"warn": "Nothing was set; check that Trio logged it as failed."}),
+    "bolus.unconfirmed": Kind(
+        "Bolus succeeded, but no pump command",
+        "Trio logged a bolus as succeeded, but TandemKit logged no matching command in the 3 minutes before "
+        "it, while TandemKit's log was being written.",
+        {"warn": "The logs can't tell whether it was sent: the command may be in lines the log lost. If it "
+                 "wasn't sent, Trio counts insulin the pump didn't give."}),
+    "bolus.units_mismatch": Kind(
+        "Bolus amount differs from TandemKit's",
+        "TandemKit sent the pump a different bolus amount than the one Trio logged.",
+        {"high": "Trio's record and the pump disagree about how much insulin was given."}),
+    "bolus.failed_but_initiated": Kind(
+        "Failed bolus that the pump accepted",
+        "Trio logged a bolus as failed, but the pump's answer to the InitiateBolusRequest accepted it.",
+        {"high": "The pump may deliver a bolus Trio thinks failed, so Trio's insulin record may leave it out."}),
+    "bolus.permission_denied": Kind(
+        "Pump refused bolus permission",
+        "Before each bolus TandemKit asks the pump for permission. The pump refused, for the reason shown.",
+        {"info": "Can happen in normal use; no bolus goes out."}),
+    "bolus.stopped_early": Kind(
+        "Bolus stopped before it finished",
+        "The pump's last-bolus status shows less delivered than requested, with the pump's reason.",
+        {"info": "Stopped by the user or over Bluetooth, with a cancel in the logs: someone stopped it.",
+         "warn": "Stopped for another reason (an alarm, a malfunction, ...), or no cancel is in the logs."}),
+    "misdated_dose.start_ahead": Kind(
+        "Future-dated dose sent as starting now",
+        "The pump's record of this dose starts later than the phone's clock. TandemKit logged it as misdated "
+        "and sent it to Trio as starting now. One finding per dose, however often it was re-sent.",
+        {"high": "A bolus or temp basal dated an hour or more ahead: Trio counts it as insulin given now. If "
+                 "it was really given earlier, Trio's insulin on board is too high.",
+         "warn": "Less than an hour ahead, or a dose that isn't a bolus or temp basal."}),
+    "misdated_dose.ends_before_start": Kind(
+        "Dose that ends before it starts",
+        "The pump's record of this dose ends before it starts. TandemKit sent it to Trio with no duration.",
+        {"warn": "The dose reaches Trio with wrong times, but isn't moved to now."}),
+    "misdated_dose.negative_delivery": Kind(
+        "Dose with a negative amount",
+        "The pump's record of this dose works out to a negative amount delivered. TandemKit sent it to Trio "
+        "as 0 U.",
+        {"warn": "Trio records no insulin for it; the pump's record is inconsistent."}),
+    "misdated_dose.other": Kind(
+        "Dose dates replaced (unknown message)",
+        "TandemKit logged that it replaced a dose's dates, in wording this parser doesn't recognize.",
+        {"warn": "Read the log line to see what happened."}),
+    "history_bolus.stale": Kind(
+        "Old history boluses sent to Trio",
+        "TandemKit sent Trio boluses from pump history right after reading bolus records dated more than "
+        "36 hours from the phone's clock; it should report none older than 24 hours. The log gives only how "
+        "many it sent, so the records listed are the ones it had just read.",
+        {"high": "An old bolus reported as recent counts as insulin on board that isn't there."}),
+    "history_backfill.prune_ratchet": Kind(
+        "Pump history read further back each pass",
+        "TandemKit reads pump history backward until it passes the oldest record it needs, and its history "
+        "store deletes records dated more than 90 days before the phone's clock. When the record the reading "
+        "stopped at is deleted, the next pass reads further back, and that is deleted in turn. This happens "
+        "when the pump's records carry dates far from real time.",
+        {"warn": "Extra reads from the pump, and a sign its dates are far off. Any effect on insulin data "
+                 "shows up as other findings."}),
+    "pump_request.outcome_line_lost": Kind(
+        "Pump command with no logged outcome",
+        "TandemKit sends one command at a time, and each ends in one logged outcome: an answer, a timeout, a "
+        "cancel, or a refusal. The next command went out with none logged for this one, so its outcome line "
+        "was lost.",
+        {"info": "A gap in the log, not a pump problem."}),
+    "pump_request.late": Kind(
+        "Pump answered after 30 s",
+        f"The pump answered after TandemKit's {RESPONSE_TIMEOUT}-second timeout, but no timeout was logged.",
+        {"warn": "Slow answers hold up the loop."}),
+    "pump_request.timeout": Kind(
+        "Pump command timed out",
+        "TandemKit stopped waiting for the pump's answer.",
+        {"warn": "The logs can't tell whether the pump acted on the command."}),
+    "pump_request.disconnect": Kind(
+        "Pump command cut off by a disconnect",
+        "The Bluetooth connection dropped before the pump answered.",
+        {"info": "Disconnects happen in normal use."}),
+    "pump_request.missing": Kind(
+        "Log ends before the pump answered",
+        "The log ends before this command's outcome.",
+        {"warn": "The outcome is unknown."}),
+    "reconnect_storm": Kind(
+        "Many pump reconnects",
+        f"{STORM_CONNECTS} or more pump connections within an hour.",
+        {"warn": "Frequent reconnects hold up the loop and use battery."}),
+    "pump_clock.drift": Kind(
+        "Pump clock differs from the phone's",
+        f"The pump's clock, read at each TimeSinceResetResponse, is more than {CLOCK_DRIFT_S // 60} minutes "
+        "off the phone's. One finding per stretch of drift.",
+        {"high": "Off by more than a day: pump history records carry dates far from real time.",
+         "warn": f"Off by more than {CLOCK_DRIFT_S // 60} minutes but less than a day."}),
+    "pump_clock.set_time": Kind(
+        "Pump clock set",
+        "TandemKit set the pump's time and date (ChangeTimeDateRequest).",
+        {"info": "Normal at setup, or when the pump's clock needs correcting."}),
+    "pump_clock.adjusted": Kind(
+        "Pump clock moved",
+        "Trio logged TandemKit moving the pump's clock. For a move during setup this is the only trace, "
+        "since it happens before Trio records the pump's own log lines.",
+        {"high": "Moved by more than a day: pump history from before the move carries the old clock's dates.",
+         "warn": f"Moved by more than {CLOCK_DRIFT_S // 60} minutes but less than a day."}),
+    "torn_lines": Kind(
+        "Torn pump log lines",
+        "In older tandem logs, two writes at the same moment could overwrite the start of a line. Exports are "
+        "never torn.",
+        {"info": "A logging artifact: some lines are incomplete."}),
+    "app_restart": Kind(
+        "Trio restarted often",
+        "Trio started more than 3 times in one day.",
+        {"info": "Look at what came just before each start: a crash, an update, or the phone closing Trio."}),
+    "loop_gap": Kind(
+        "No successful loop",
+        "More than 15 minutes between successful loops, with what the logs show during the gap: loop "
+        "failures, missing glucose, pump disconnects, or stretches when Trio wrote nothing to its log.",
+        {"warn": "30 minutes or more.", "info": "15 to 30 minutes."}),
+}
+
